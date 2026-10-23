@@ -1,4 +1,4 @@
-name: Build FocusFB (IPA + Dylib + DEB)
+name: Build FocusFB v2.0 (IPA + Dylib + DEB)
 
 on:
   push:
@@ -40,7 +40,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build su macOS (iOS arm64)
+    name: Build v2.0 su macOS (iOS arm64)
     runs-on: macos-latest
     permissions:
       contents: write
@@ -49,36 +49,55 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Rileva struttura progetto (root, sottocartella o ZIP)
+      - name: Rileva struttura progetto v2.0 (cartella src/ o archivio FocusFB-v2.zip)
         run: |
           set -euo pipefail
           PROJECT_ROOT=""
-          if [[ -f "$GITHUB_WORKSPACE/src/Tweak.mm" ]]; then
-            PROJECT_ROOT="$GITHUB_WORKSPACE"
-          else
-            FOUND_TW="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/Tweak.mm' -print -quit)"
-            if [[ -n "$FOUND_TW" ]]; then
-              PROJECT_ROOT="$(dirname "$(dirname "$FOUND_TW")")"
+
+          # 1. Priorita' a un archivio FocusFB-v2*.zip se caricato direttamente nel repo (anche senza estrarlo!)
+          FOUND_V2_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -iname 'FocusFB*v2*.zip' -print -quit || true)"
+          if [[ -n "$FOUND_V2_ZIP" ]]; then
+            echo "Trovato pacchetto v2.0 ($FOUND_V2_ZIP): estrazione prioritaria..."
+            mkdir -p "$RUNNER_TEMP/extracted_v2"
+            unzip -q -o "$FOUND_V2_ZIP" -d "$RUNNER_TEMP/extracted_v2"
+            FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_v2" -maxdepth 4 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+            if [[ -n "$FOUND_LOCK" ]]; then
+              PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
+            fi
+          fi
+
+          # 2. Altrimenti cerca src/FocusFBLockManager.mm direttamente nel repository
+          if [[ -z "$PROJECT_ROOT" ]]; then
+            if [[ -f "$GITHUB_WORKSPACE/src/FocusFBLockManager.mm" ]]; then
+              PROJECT_ROOT="$GITHUB_WORKSPACE"
             else
-              FOUND_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name '*.zip' -print -quit)"
-              if [[ -n "$FOUND_ZIP" ]]; then
-                echo "Trovato archivio ZIP ($FOUND_ZIP): estrazione automatica..."
-                mkdir -p "$RUNNER_TEMP/extracted_repo"
-                unzip -q "$FOUND_ZIP" -d "$RUNNER_TEMP/extracted_repo"
-                FOUND_TW="$(find "$RUNNER_TEMP/extracted_repo" -maxdepth 3 -path '*/src/Tweak.mm' -print -quit)"
-                if [[ -n "$FOUND_TW" ]]; then
-                  PROJECT_ROOT="$(dirname "$(dirname "$FOUND_TW")")"
-                fi
+              FOUND_LOCK="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+              if [[ -n "$FOUND_LOCK" ]]; then
+                PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
               fi
             fi
           fi
 
-          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/Tweak.mm" ]]; then
-            echo "::error::Impossibile trovare src/Tweak.mm nel repository."
+          # 3. Altrimenti cerca qualunque altro archivio .zip nel repository che contenga la v2.0
+          if [[ -z "$PROJECT_ROOT" ]]; then
+            FOUND_ANY_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name '*.zip' -print -quit || true)"
+            if [[ -n "$FOUND_ANY_ZIP" ]]; then
+              echo "Trovato archivio ZIP ($FOUND_ANY_ZIP): estrazione automatica..."
+              mkdir -p "$RUNNER_TEMP/extracted_any"
+              unzip -q -o "$FOUND_ANY_ZIP" -d "$RUNNER_TEMP/extracted_any"
+              FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_any" -maxdepth 4 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+              if [[ -n "$FOUND_LOCK" ]]; then
+                PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
+              fi
+            fi
+          fi
+
+          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/FocusFBLockManager.mm" ]]; then
+            echo "::error::File sorgenti v2.0 (FocusFBLockManager.mm) non trovati! Carica nel repository il file FocusFB-v2.zip (anche senza estrarlo) oppure trascina la cartella src/ aggiornata."
             exit 1
           fi
 
-          echo "Cartella progetto rilevata: $PROJECT_ROOT"
+          echo "Cartella progetto v2.0 rilevata: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
       - name: Installa ldid e dpkg
@@ -88,37 +107,13 @@ jobs:
           brew install ldid-procursus || brew install ldid
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Compila e verifica FocusFB.dylib con Xcode iOS SDK (arm64, zero Substrate)
+      - name: Compila e verifica FocusFB.dylib v2.0 con Xcode iOS SDK (arm64, zero Substrate)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
 
-          # Auto-fix compatibilita' sintassi ObjC++ se i file src/ provengono dalla prima revisione
-          python3 - "$PROJECT_ROOT" <<'PY'
-          from pathlib import Path
-          import sys
-
-          root = Path(sys.argv[1])
-          vc_file = root / "src" / "FocusFBSettingsViewController.mm"
-          if vc_file.exists():
-              txt = vc_file.read_text()
-              fixed = (
-                  txt.replace(
-                      "UISheetPresentationControllerDetent.largeDetent",
-                      "[UISheetPresentationControllerDetent largeDetent]"
-                  )
-                  .replace(
-                      "__weak typeof(self) weakSelf = self;",
-                      "__weak FocusFBSettingsViewController *weakSelf = self;"
-                  )
-              )
-              if fixed != txt:
-                  vc_file.write_text(fixed)
-                  print("[AutoFix] Aggiornata sintassi ObjC++ in FocusFBSettingsViewController.mm")
-          PY
-
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "Compilazione con iOS SDK: $SDK_PATH"
+          echo "Compilazione FocusFB v2.0 con iOS SDK: $SDK_PATH"
 
           xcrun --sdk iphoneos clang++ \
             -isysroot "$SDK_PATH" \
@@ -138,6 +133,7 @@ jobs:
             "$PROJECT_ROOT/src/FocusFBSideloadFix.mm" \
             "$PROJECT_ROOT/src/FocusFBTabManager.mm" \
             "$PROJECT_ROOT/src/FocusFBSettingsViewController.mm" \
+            "$PROJECT_ROOT/src/FocusFBLockManager.mm" \
             -lobjc \
             -framework Foundation \
             -framework CoreFoundation \
@@ -146,6 +142,8 @@ jobs:
             -framework CoreGraphics \
             -framework Security \
             -framework AVFoundation \
+            -framework CoreImage \
+            -weak_framework CoreNFC \
             -o "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
 
           ldid -S "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
@@ -155,7 +153,7 @@ jobs:
 
           python3 "$PROJECT_ROOT/scripts/verify_dylib.py" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
 
-      - name: Crea pacchetto .deb (per Feather / Sileo / cyan)
+      - name: Crea pacchetto .deb v2.0 (per Feather / Sileo / cyan)
         run: |
           set -euo pipefail
           PKG_ROOT="$RUNNER_TEMP/deb_stage"
@@ -170,10 +168,10 @@ jobs:
           chmod 0755 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
           chmod 0644 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
 
-          dpkg-deb -Zgzip --root-owner-group -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_1.0.0_iphoneos-arm64.deb" \
-            || dpkg-deb -Zgzip -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_1.0.0_iphoneos-arm64.deb"
+          dpkg-deb -Zgzip --root-owner-group -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_2.0.0_iphoneos-arm64.deb" \
+            || dpkg-deb -Zgzip -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_2.0.0_iphoneos-arm64.deb"
 
-      - name: Scarica IPA e inietta FocusFB con cyan (se ipa_url fornito)
+      - name: Scarica IPA e inietta FocusFB v2.0 con cyan (se ipa_url fornito)
         if: ${{ inputs.ipa_url != '' }}
         env:
           INPUT_IPA_URL: ${{ inputs.ipa_url }}
@@ -210,6 +208,9 @@ jobs:
             exit 1
           fi
 
+          MERGE_PLIST="$RUNNER_TEMP/focusfb_info_merge.plist"
+          python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scansione chiave NFC per sbloccare FocusFB"}, open(sys.argv[1], "wb"))' "$MERGE_PLIST"
+
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
           CYAN_ARGS=(
@@ -218,6 +219,7 @@ jobs:
             -u -w -q -s --overwrite
             -n "$INPUT_DISPLAY_NAME"
             -b "$INPUT_BUNDLE_ID"
+            -l "$MERGE_PLIST"
             -f "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
           )
 
@@ -243,6 +245,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: focusfb-run-${{ github.run_number }}
-          name: FocusFB Build #${{ github.run_number }}
+          name: FocusFB v2.0 Build #${{ github.run_number }}
           files: dist/*
           draft: true
