@@ -60,40 +60,40 @@ jobs:
             echo "Trovato pacchetto v2.0 ($FOUND_V2_ZIP): estrazione prioritaria..."
             mkdir -p "$RUNNER_TEMP/extracted_v2"
             unzip -q -o "$FOUND_V2_ZIP" -d "$RUNNER_TEMP/extracted_v2"
-            FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_v2" -maxdepth 4 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+            FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_v2" -maxdepth 4 -path '*/src/FocusFBAdBlocker.mm' -print -quit || true)"
             if [[ -n "$FOUND_LOCK" ]]; then
               PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
             fi
           fi
 
-          # 2. Altrimenti cerca src/FocusFBLockManager.mm direttamente nel repository
+          # 2. Altrimenti cerca src/FocusFBAdBlocker.mm direttamente nel repository
           if [[ -z "$PROJECT_ROOT" ]]; then
-            if [[ -f "$GITHUB_WORKSPACE/src/FocusFBLockManager.mm" ]]; then
+            if [[ -f "$GITHUB_WORKSPACE/src/FocusFBAdBlocker.mm" ]]; then
               PROJECT_ROOT="$GITHUB_WORKSPACE"
             else
-              FOUND_LOCK="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+              FOUND_LOCK="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/FocusFBAdBlocker.mm' -print -quit || true)"
               if [[ -n "$FOUND_LOCK" ]]; then
                 PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
               fi
             fi
           fi
 
-          # 3. Altrimenti cerca qualunque altro archivio .zip nel repository che contenga la v2.0
+          # 3. Altrimenti cerca qualunque altro archivio .zip nel repository che contenga la v2.0 + AdBlock
           if [[ -z "$PROJECT_ROOT" ]]; then
             FOUND_ANY_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name '*.zip' -print -quit || true)"
             if [[ -n "$FOUND_ANY_ZIP" ]]; then
               echo "Trovato archivio ZIP ($FOUND_ANY_ZIP): estrazione automatica..."
               mkdir -p "$RUNNER_TEMP/extracted_any"
               unzip -q -o "$FOUND_ANY_ZIP" -d "$RUNNER_TEMP/extracted_any"
-              FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_any" -maxdepth 4 -path '*/src/FocusFBLockManager.mm' -print -quit || true)"
+              FOUND_LOCK="$(find "$RUNNER_TEMP/extracted_any" -maxdepth 4 -path '*/src/FocusFBAdBlocker.mm' -print -quit || true)"
               if [[ -n "$FOUND_LOCK" ]]; then
                 PROJECT_ROOT="$(dirname "$(dirname "$FOUND_LOCK")")"
               fi
             fi
           fi
 
-          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/FocusFBLockManager.mm" ]]; then
-            echo "::error::File sorgenti v2.0 (FocusFBLockManager.mm) non trovati! Carica nel repository il file FocusFB-v2.zip (anche senza estrarlo) oppure trascina la cartella src/ aggiornata."
+          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/FocusFBAdBlocker.mm" ]]; then
+            echo "::error::File sorgenti v2.0 + AdBlock (FocusFBAdBlocker.mm) non trovati! Carica nel repository il file FocusFB-v2.zip (anche senza estrarlo) oppure trascina la cartella src/ aggiornata."
             exit 1
           fi
 
@@ -134,6 +134,7 @@ jobs:
             "$PROJECT_ROOT/src/FocusFBTabManager.mm" \
             "$PROJECT_ROOT/src/FocusFBSettingsViewController.mm" \
             "$PROJECT_ROOT/src/FocusFBLockManager.mm" \
+            "$PROJECT_ROOT/src/FocusFBAdBlocker.mm" \
             -lobjc \
             -framework Foundation \
             -framework CoreFoundation \
