@@ -31,6 +31,9 @@ on:
         default: true
         type: boolean
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -50,78 +53,98 @@ jobs:
         run: |
           set -euo pipefail
           PROJECT_ROOT=""
-          if [[ -f "$GITHUB_WORKSPACE/Makefile" ]]; then
+          if [[ -f "$GITHUB_WORKSPACE/src/Tweak.mm" ]]; then
             PROJECT_ROOT="$GITHUB_WORKSPACE"
           else
-            FOUND_MK="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name Makefile -print -quit)"
-            if [[ -n "$FOUND_MK" ]]; then
-              PROJECT_ROOT="$(dirname "$FOUND_MK")"
+            FOUND_TW="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/Tweak.mm' -print -quit)"
+            if [[ -n "$FOUND_TW" ]]; then
+              PROJECT_ROOT="$(dirname "$(dirname "$FOUND_TW")")"
             else
               FOUND_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name '*.zip' -print -quit)"
               if [[ -n "$FOUND_ZIP" ]]; then
                 echo "Trovato archivio ZIP ($FOUND_ZIP): estrazione automatica..."
                 mkdir -p "$RUNNER_TEMP/extracted_repo"
                 unzip -q "$FOUND_ZIP" -d "$RUNNER_TEMP/extracted_repo"
-                FOUND_MK="$(find "$RUNNER_TEMP/extracted_repo" -maxdepth 3 -name Makefile -print -quit)"
-                if [[ -n "$FOUND_MK" ]]; then
-                  PROJECT_ROOT="$(dirname "$FOUND_MK")"
+                FOUND_TW="$(find "$RUNNER_TEMP/extracted_repo" -maxdepth 3 -path '*/src/Tweak.mm' -print -quit)"
+                if [[ -n "$FOUND_TW" ]]; then
+                  PROJECT_ROOT="$(dirname "$(dirname "$FOUND_TW")")"
                 fi
               fi
             fi
           fi
 
-          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/Makefile" ]]; then
-            echo "::error::Impossibile trovare Makefile nel repository. Assicurati di aver caricato i file del progetto (src/, scripts/, Makefile) o FocusFB-repo.zip."
+          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/src/Tweak.mm" ]]; then
+            echo "::error::Impossibile trovare src/Tweak.mm nel repository."
             exit 1
           fi
 
           echo "Cartella progetto rilevata: $PROJECT_ROOT"
           echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
 
-      - name: Installa dipendenze (GNU Make, ldid, dpkg)
+      - name: Installa ldid e dpkg
         run: |
           set -euo pipefail
-          brew install make dpkg
+          brew install dpkg
           brew install ldid-procursus || brew install ldid
-          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Configura Theos + iOS SDK
-        run: |
-          set -euo pipefail
-          export THEOS="$RUNNER_TEMP/theos"
-          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
-          echo "SDK iOS rilevato: $(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
-
-      - name: Compila e verifica FocusFB.dylib (arm64, zero Substrate)
+      - name: Compila e verifica FocusFB.dylib con Xcode iOS SDK (arm64, zero Substrate)
         run: |
           set -euo pipefail
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          make -C "$PROJECT_ROOT" ARCHS=arm64 FINALPACKAGE=1 clean all
 
-          DYLIB_SRC=""
-          for candidate in \
-            "$PROJECT_ROOT/.theos/obj/arm64/FocusFB.dylib" \
-            "$PROJECT_ROOT/.theos/obj/FocusFB.dylib" \
-            "$PROJECT_ROOT/.theos/obj/debug/arm64/FocusFB.dylib" \
-            "$PROJECT_ROOT/.theos/obj/debug/FocusFB.dylib"; do
-            if [[ -f "$candidate" ]]; then
-              DYLIB_SRC="$candidate"
-              break
-            fi
-          done
+          # Auto-fix compatibilita' sintassi ObjC++ se i file src/ provengono dalla prima revisione
+          python3 - "$PROJECT_ROOT" <<'PY'
+          from pathlib import Path
+          import sys
 
-          if [[ -z "$DYLIB_SRC" ]]; then
-            echo "::error::Compilazione fallita: FocusFB.dylib non trovata."
-            exit 1
-          fi
+          root = Path(sys.argv[1])
+          vc_file = root / "src" / "FocusFBSettingsViewController.mm"
+          if vc_file.exists():
+              txt = vc_file.read_text()
+              fixed = txt.replace(
+                  "UISheetPresentationControllerDetent.largeDetent",
+                  "[UISheetPresentationControllerDetent largeDetent]"
+              )
+              if fixed != txt:
+                  vc_file.write_text(fixed)
+                  print("[AutoFix] Aggiornato largeDetent in FocusFBSettingsViewController.mm")
+          PY
 
-          cp "$DYLIB_SRC" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
-          install_name_tool -id "@rpath/FocusFB.dylib" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "Compilazione con iOS SDK: $SDK_PATH"
+
+          xcrun --sdk iphoneos clang++ \
+            -isysroot "$SDK_PATH" \
+            -target arm64-apple-ios15.0 \
+            -dynamiclib \
+            -std=c++17 \
+            -fobjc-arc \
+            -fobjc-exceptions \
+            -fobjc-call-cxx-cdtors \
+            -O2 \
+            -Wno-deprecated-declarations \
+            -Wno-undeclared-selector \
+            -install_name "@rpath/FocusFB.dylib" \
+            -I"$PROJECT_ROOT/src" \
+            "$PROJECT_ROOT/src/Tweak.mm" \
+            "$PROJECT_ROOT/src/FocusFBPrefs.mm" \
+            "$PROJECT_ROOT/src/FocusFBSideloadFix.mm" \
+            "$PROJECT_ROOT/src/FocusFBTabManager.mm" \
+            "$PROJECT_ROOT/src/FocusFBSettingsViewController.mm" \
+            -lobjc \
+            -framework Foundation \
+            -framework CoreFoundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreGraphics \
+            -framework Security \
+            -framework AVFoundation \
+            -o "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+
           ldid -S "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
 
-          echo "--- Dipendenze otool -L ---"
+          echo "--- Dipendenze dinamiche (otool -L) ---"
           otool -L "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
 
           python3 "$PROJECT_ROOT/scripts/verify_dylib.py" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
