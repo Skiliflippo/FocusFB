@@ -1,0 +1,65 @@
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import <os/log.h>
+
+#import "FocusFBPrefs.h"
+#import "FocusFBSideloadFix.h"
+#import "FocusFBTabManager.h"
+
+static BOOL FocusFBShouldActivateInCurrentProcess(void) {
+    NSBundle *mainBundle = [NSBundle mainBundle];
+    NSString *bundlePath = mainBundle.bundlePath ?: @"";
+
+    // Ignora sempre eventuali App Extensions (.appex)
+    if ([[bundlePath pathExtension].lowercaseString isEqualToString:@"appex"]) {
+        return NO;
+    }
+
+    NSDictionary *info = mainBundle.infoDictionary ?: @{};
+    NSString *executable = info[@"CFBundleExecutable"] ?: @"";
+    NSString *bundleID = mainBundle.bundleIdentifier ?: @"";
+
+    if ([executable isEqualToString:@"Facebook"]) return YES;
+    if ([bundleID.lowercaseString containsString:@"facebook"] &&
+        ![bundleID.lowercaseString containsString:@"messenger"]) {
+        return YES;
+    }
+    if (NSClassFromString(@"FBTabBarViewController") != nil ||
+        NSClassFromString(@"FBFloatingTabBar") != nil ||
+        NSClassFromString(@"FBAppDelegate") != nil) {
+        return YES;
+    }
+    return NO;
+}
+
+__attribute__((constructor))
+static void FocusFBConstructor(void) {
+    @autoreleasepool {
+        if (!FocusFBShouldActivateInCurrentProcess()) {
+            return;
+        }
+
+        os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO,
+                         "[FocusFB] Loaded in bundle=%{public}@ iOS=%{public}@",
+                         NSBundle.mainBundle.bundleIdentifier ?: @"-",
+                         UIDevice.currentDevice.systemVersion);
+
+        // Inizializza preferenze di default ("Solo Marketplace" attivo al primo avvio)
+        (void)[FocusFBPrefs shared];
+
+        // Applica fix Keychain / AppGroups per Sideloading (SideStore, Feather, LiveContainer)
+        FocusFBInstallSideloadFixesIfNeeded();
+
+        // Avvia il motore UI sia su DidFinishLaunching sia su main queue (supporta anche late-loading)
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            FocusFBStartEngine();
+        }];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FocusFBStartEngine();
+        });
+    }
+}
