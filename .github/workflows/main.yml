@@ -102,13 +102,19 @@ jobs:
           vc_file = root / "src" / "FocusFBSettingsViewController.mm"
           if vc_file.exists():
               txt = vc_file.read_text()
-              fixed = txt.replace(
-                  "UISheetPresentationControllerDetent.largeDetent",
-                  "[UISheetPresentationControllerDetent largeDetent]"
+              fixed = (
+                  txt.replace(
+                      "UISheetPresentationControllerDetent.largeDetent",
+                      "[UISheetPresentationControllerDetent largeDetent]"
+                  )
+                  .replace(
+                      "__weak typeof(self) weakSelf = self;",
+                      "__weak FocusFBSettingsViewController *weakSelf = self;"
+                  )
               )
               if fixed != txt:
                   vc_file.write_text(fixed)
-                  print("[AutoFix] Aggiornato largeDetent in FocusFBSettingsViewController.mm")
+                  print("[AutoFix] Aggiornata sintassi ObjC++ in FocusFBSettingsViewController.mm")
           PY
 
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
@@ -118,7 +124,7 @@ jobs:
             -isysroot "$SDK_PATH" \
             -target arm64-apple-ios15.0 \
             -dynamiclib \
-            -std=c++17 \
+            -std=gnu++17 \
             -fobjc-arc \
             -fobjc-exceptions \
             -fobjc-call-cxx-cdtors \
