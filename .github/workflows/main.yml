@@ -1,0 +1,219 @@
+name: Build FocusFB (IPA + Dylib + DEB)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "URL all'IPA decrittata di Facebook (lascia vuoto se vuoi solo FocusFB.dylib per LiveContainer/Feather)"
+        required: false
+        default: ""
+        type: string
+      display_name:
+        description: "Nome App sulla Home di iOS (es. Facebook oppure Marketplace)"
+        required: true
+        default: "Facebook"
+        type: string
+      bundle_id:
+        description: "Bundle ID (es. com.facebook.Facebook oppure com.facebook.Facebook.focus)"
+        required: true
+        default: "com.facebook.Facebook"
+        type: string
+      remove_extensions:
+        description: "Rimuovi App Extensions (Consigliato TRUE per SideStore / risparmio App ID)"
+        required: true
+        default: true
+        type: boolean
+      publish_draft_release:
+        description: "Crea anche una Draft Release nella scheda Releases del repository"
+        required: true
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build su macOS (iOS arm64)
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Rileva struttura progetto (root, sottocartella o ZIP)
+        run: |
+          set -euo pipefail
+          PROJECT_ROOT=""
+          if [[ -f "$GITHUB_WORKSPACE/Makefile" ]]; then
+            PROJECT_ROOT="$GITHUB_WORKSPACE"
+          else
+            FOUND_MK="$(find "$GITHUB_WORKSPACE" -maxdepth 3 -name Makefile -print -quit)"
+            if [[ -n "$FOUND_MK" ]]; then
+              PROJECT_ROOT="$(dirname "$FOUND_MK")"
+            else
+              FOUND_ZIP="$(find "$GITHUB_WORKSPACE" -maxdepth 2 -name '*.zip' -print -quit)"
+              if [[ -n "$FOUND_ZIP" ]]; then
+                echo "Trovato archivio ZIP ($FOUND_ZIP): estrazione automatica..."
+                mkdir -p "$RUNNER_TEMP/extracted_repo"
+                unzip -q "$FOUND_ZIP" -d "$RUNNER_TEMP/extracted_repo"
+                FOUND_MK="$(find "$RUNNER_TEMP/extracted_repo" -maxdepth 3 -name Makefile -print -quit)"
+                if [[ -n "$FOUND_MK" ]]; then
+                  PROJECT_ROOT="$(dirname "$FOUND_MK")"
+                fi
+              fi
+            fi
+          fi
+
+          if [[ -z "$PROJECT_ROOT" || ! -f "$PROJECT_ROOT/Makefile" ]]; then
+            echo "::error::Impossibile trovare Makefile nel repository. Assicurati di aver caricato i file del progetto (src/, scripts/, Makefile) o FocusFB-repo.zip."
+            exit 1
+          fi
+
+          echo "Cartella progetto rilevata: $PROJECT_ROOT"
+          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
+
+      - name: Installa dipendenze (GNU Make, ldid, dpkg)
+        run: |
+          set -euo pipefail
+          brew install make dpkg
+          brew install ldid-procursus || brew install ldid
+          echo "$(brew --prefix make)/libexec/gnubin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Configura Theos + iOS SDK
+        run: |
+          set -euo pipefail
+          export THEOS="$RUNNER_TEMP/theos"
+          git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "$THEOS"
+          echo "SDK iOS rilevato: $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "THEOS=$THEOS" >> "$GITHUB_ENV"
+
+      - name: Compila e verifica FocusFB.dylib (arm64, zero Substrate)
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          make -C "$PROJECT_ROOT" ARCHS=arm64 FINALPACKAGE=1 clean all
+
+          DYLIB_SRC=""
+          for candidate in \
+            "$PROJECT_ROOT/.theos/obj/arm64/FocusFB.dylib" \
+            "$PROJECT_ROOT/.theos/obj/FocusFB.dylib" \
+            "$PROJECT_ROOT/.theos/obj/debug/arm64/FocusFB.dylib" \
+            "$PROJECT_ROOT/.theos/obj/debug/FocusFB.dylib"; do
+            if [[ -f "$candidate" ]]; then
+              DYLIB_SRC="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$DYLIB_SRC" ]]; then
+            echo "::error::Compilazione fallita: FocusFB.dylib non trovata."
+            exit 1
+          fi
+
+          cp "$DYLIB_SRC" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+          install_name_tool -id "@rpath/FocusFB.dylib" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+          ldid -S "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+
+          echo "--- Dipendenze otool -L ---"
+          otool -L "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+
+          python3 "$PROJECT_ROOT/scripts/verify_dylib.py" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+
+      - name: Crea pacchetto .deb (per Feather / Sileo / cyan)
+        run: |
+          set -euo pipefail
+          PKG_ROOT="$RUNNER_TEMP/deb_stage"
+          rm -rf "$PKG_ROOT"
+          mkdir -p "$PKG_ROOT/DEBIAN" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries"
+
+          cp "$GITHUB_WORKSPACE/dist/FocusFB.dylib" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
+          cp "$PROJECT_ROOT/FocusFB.plist" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
+          cp "$PROJECT_ROOT/control" "$PKG_ROOT/DEBIAN/control"
+
+          chmod -R 0755 "$PKG_ROOT/DEBIAN"
+          chmod 0755 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
+          chmod 0644 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
+
+          dpkg-deb -Zgzip --root-owner-group -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_1.0.0_iphoneos-arm64.deb" \
+            || dpkg-deb -Zgzip -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_1.0.0_iphoneos-arm64.deb"
+
+      - name: Scarica IPA e inietta FocusFB con cyan (se ipa_url fornito)
+        if: ${{ inputs.ipa_url != '' }}
+        env:
+          INPUT_IPA_URL: ${{ inputs.ipa_url }}
+          INPUT_DISPLAY_NAME: ${{ inputs.display_name }}
+          INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+          INPUT_REMOVE_EXT: ${{ inputs.remove_extensions }}
+        run: |
+          set -euo pipefail
+          IPA_IN="$RUNNER_TEMP/facebook_clean.ipa"
+          URL_TO_FETCH="$INPUT_IPA_URL"
+
+          # Conversione automatica link di condivisione Dropbox (?dl=0 -> ?dl=1)
+          if [[ "$URL_TO_FETCH" == *"dropbox.com"* ]]; then
+            URL_TO_FETCH="${URL_TO_FETCH/\?dl=0/?dl=1}"
+            URL_TO_FETCH="${URL_TO_FETCH/&dl=0/&dl=1}"
+          fi
+
+          if [[ "$URL_TO_FETCH" == *"drive.google.com"* ]]; then
+            echo "Rilevato link Google Drive: download tramite gdown --fuzzy..."
+            pipx run gdown --fuzzy "$URL_TO_FETCH" -O "$IPA_IN"
+          else
+            echo "Download diretto dell'IPA con curl..."
+            curl --fail --location --retry 3 --retry-delay 2 "$URL_TO_FETCH" -o "$IPA_IN"
+          fi
+
+          MIME_TYPE="$(file --mime-type -b "$IPA_IN")"
+          if [[ "$MIME_TYPE" != "application/zip" && "$MIME_TYPE" != "application/x-ios-app" && "$MIME_TYPE" != "application/octet-stream" ]]; then
+            echo "::error::Il link fornito non ha scaricato un file IPA valido (tipo rilevato: $MIME_TYPE). Assicurati che sia un link di download diretto e pubblico."
+            exit 1
+          fi
+
+          if ! unzip -tq "$IPA_IN" >/dev/null; then
+            echo "::error::Il file scaricato non e' un archivio IPA/ZIP integro."
+            exit 1
+          fi
+
+          pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+          CYAN_ARGS=(
+            -i "$IPA_IN"
+            -o "$GITHUB_WORKSPACE/dist/FocusFB_Patched.ipa"
+            -u -w -q -s --overwrite
+            -n "$INPUT_DISPLAY_NAME"
+            -b "$INPUT_BUNDLE_ID"
+            -f "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+          )
+
+          if [[ "$INPUT_REMOVE_EXT" == "true" ]]; then
+            CYAN_ARGS+=( -e )
+          fi
+
+          cyan "${CYAN_ARGS[@]}"
+          unzip -tq "$GITHUB_WORKSPACE/dist/FocusFB_Patched.ipa" >/dev/null
+          ls -lh "$GITHUB_WORKSPACE/dist/"
+
+      - name: Carica Artifacts scaricabili nella pagina Actions
+        uses: actions/upload-artifact@v4
+        with:
+          name: FocusFB-Build-Output
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Crea Draft Release su GitHub (se abilitato da workflow_dispatch)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_draft_release == true }}
+        continue-on-error: true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: focusfb-run-${{ github.run_number }}
+          name: FocusFB Build #${{ github.run_number }}
+          files: dist/*
+          draft: true
