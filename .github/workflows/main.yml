@@ -1,34 +1,37 @@
-name: Build FocusFB v2.2 (IPA + Dylib + DEB)
+name: Build FocusFB
 
 on:
   push:
     branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
     inputs:
       ipa_url:
-        description: "URL all'IPA decrittata di Facebook (lascia vuoto se usi LiveContainer con FocusFB.dylib o hai salvato IPA_URL nelle Variables)"
+        description: "URL alla tua IPA decrittata di Facebook (lascia vuoto per compilare solo FocusFB.dylib e .deb)"
         required: false
         default: ""
         type: string
       display_name:
-        description: "Nome App sulla Home di iOS (es. Facebook oppure Marketplace)"
+        description: "Nome app su iPhone (quando inietti IPA)"
         required: true
         default: "Facebook"
         type: string
       bundle_id:
-        description: "Bundle ID (es. com.facebook.Facebook oppure com.facebook.Facebook.focus)"
+        description: "Bundle ID (quando inietti IPA)"
         required: true
         default: "com.facebook.Facebook"
         type: string
       remove_extensions:
-        description: "Rimuovi App Extensions (Consigliato TRUE per SideStore / risparmio App ID)"
+        description: "Rimuovi App Extensions nell'IPA (consigliato per SideStore)"
         required: true
         default: true
         type: boolean
-      publish_draft_release:
-        description: "Crea anche una Draft Release nella scheda Releases del repository"
+      publish_public_release:
+        description: "Pubblica anche una Release pubblica con FocusFB.dylib e .deb (senza IPA)"
         required: true
-        default: true
+        default: false
         type: boolean
 
 env:
@@ -40,7 +43,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build v2.2 su macOS (iOS arm64)
+    name: Build iOS arm64
     runs-on: macos-latest
     permissions:
       contents: write
@@ -48,72 +51,61 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Rileva e verifica sorgenti FocusFB v2.2 (FocusFB-v2.2.zip o cartella src/)
+      - name: Auto-estrazione e pulizia repo (se caricato FocusFB-Repo-v2.4.zip via web)
+        if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
-          PROJECT_ROOT=""
-
-          check_v22_tree() {
-            local candidate="$1"
-            if [[ -f "$candidate/src/FocusFBAdBlocker.mm" ]] && \
-               grep -q "RCTNetworking" "$candidate/src/FocusFBAdBlocker.mm" && \
-               grep -q "FocusFB 2.2" "$candidate/src/FocusFBSettingsViewController.mm"; then
-              PROJECT_ROOT="$candidate"
-              return 0
+          ZIP_CANDIDATE=""
+          for f in FocusFB-Repo-v2.4.zip FocusFB-Repo*.zip; do
+            if [[ -f "$f" ]]; then
+              ZIP_CANDIDATE="$f"
+              break
             fi
-            return 1
-          }
+          done
 
-          # 1. Priorita' assoluta a FocusFB-v2.2.zip (ignora eventuali vecchi FocusFB-v2.zip rimasti nel repo!)
-          while IFS= read -r -d '' zfile; do
-            echo "Controllo archivio ZIP: $zfile"
-            EX_DIR="$RUNNER_TEMP/ex_$(basename "$zfile" .zip)_$$_$RANDOM"
-            mkdir -p "$EX_DIR"
-            if unzip -q -o "$zfile" -d "$EX_DIR"; then
-              while IFS= read -r -d '' found_ad; do
-                CAND="$(dirname "$(dirname "$found_ad")")"
-                if check_v22_tree "$CAND"; then
-                  echo "Sorgenti v2.2 verificati dentro: $zfile"
-                  break 2
-                fi
-              done < <(find "$EX_DIR" -maxdepth 4 -path '*/src/FocusFBAdBlocker.mm' -print0)
-            fi
-          done < <(find "$GITHUB_WORKSPACE" -maxdepth 2 \( -iname '*v2.2*.zip' -o -iname '*.zip' \) -print0)
+          if [[ -n "$ZIP_CANDIDATE" ]]; then
+            echo "Trovato $ZIP_CANDIDATE: estrazione file puliti e rimozione vecchi zip..."
+            CLEAN_TMP="$RUNNER_TEMP/clean_repo_v24"
+            rm -rf "$CLEAN_TMP"
+            mkdir -p "$CLEAN_TMP"
+            unzip -q -o "$ZIP_CANDIDATE" -d "$CLEAN_TMP"
 
-          # 2. Altrimenti controlla direttamente la cartella src/ del repository
-          if [[ -z "$PROJECT_ROOT" ]]; then
-            while IFS= read -r -d '' found_ad; do
-              CAND="$(dirname "$(dirname "$found_ad")")"
-              if check_v22_tree "$CAND"; then
-                echo "Sorgenti v2.2 verificati direttamente nel repository: $CAND"
-                break
+            # Copia tutti i file del progetto nella root (escludendo .github/workflows che non puo' essere toccato da GITHUB_TOKEN)
+            rm -rf "$CLEAN_TMP/.github/workflows"
+            cp -R "$CLEAN_TMP/." "$GITHUB_WORKSPACE/"
+
+            # Elimina tutti i vecchi file .zip e vecchie guide ridondanti dalla root del repository
+            git rm -f --ignore-unmatch *.zip GUIDA_COMPLETA_IT.md >/dev/null 2>&1 || true
+            rm -f "$GITHUB_WORKSPACE"/*.zip "$GITHUB_WORKSPACE/GUIDA_COMPLETA_IT.md"
+            chmod +x "$GITHUB_WORKSPACE/scripts/"*.sh "$GITHUB_WORKSPACE/scripts/"*.py 2>/dev/null || true
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add -A
+            if ! git diff --cached --quiet; then
+              git commit -m "FocusFB v2.4: clean open-source repository structure"
+              if [[ "${GITHUB_REF}" == refs/heads/* ]]; then
+                git push origin "HEAD:${GITHUB_REF_NAME}"
+                echo "Repository ripulito e aggiornato automaticamente su GitHub!"
               fi
-            done < <(find "$GITHUB_WORKSPACE" -maxdepth 3 -path '*/src/FocusFBAdBlocker.mm' -print0)
+            fi
           fi
 
-          if [[ -z "$PROJECT_ROOT" ]]; then
-            echo "::error::Sorgenti FocusFB v2.2 non trovati nel repository! Carica il nuovo file FocusFB-v2.2.zip nella root del repository (anche senza estrarlo)."
-            exit 1
-          fi
-
-          echo "Cartella progetto v2.2 attiva: $PROJECT_ROOT"
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-
-      - name: Installa ldid e dpkg
+      - name: Install build tools (ldid & dpkg)
         run: |
           set -euo pipefail
           brew install dpkg
           brew install ldid-procursus || brew install ldid
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Compila e verifica FocusFB.dylib v2.2 con Xcode iOS SDK (arm64, zero Substrate)
+      - name: Compile FocusFB.dylib
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/dist"
-
+          mkdir -p dist
           SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-          echo "Compilazione FocusFB v2.2 con iOS SDK: $SDK_PATH"
 
           xcrun --sdk iphoneos clang++ \
             -isysroot "$SDK_PATH" \
@@ -127,14 +119,15 @@ jobs:
             -Wno-deprecated-declarations \
             -Wno-undeclared-selector \
             -install_name "@rpath/FocusFB.dylib" \
-            -I"$PROJECT_ROOT/src" \
-            "$PROJECT_ROOT/src/Tweak.mm" \
-            "$PROJECT_ROOT/src/FocusFBPrefs.mm" \
-            "$PROJECT_ROOT/src/FocusFBSideloadFix.mm" \
-            "$PROJECT_ROOT/src/FocusFBTabManager.mm" \
-            "$PROJECT_ROOT/src/FocusFBSettingsViewController.mm" \
-            "$PROJECT_ROOT/src/FocusFBLockManager.mm" \
-            "$PROJECT_ROOT/src/FocusFBAdBlocker.mm" \
+            -Isrc \
+            src/Tweak.mm \
+            src/FocusFBFishhook.mm \
+            src/FocusFBPrefs.mm \
+            src/FocusFBSideloadFix.mm \
+            src/FocusFBTabManager.mm \
+            src/FocusFBSettingsViewController.mm \
+            src/FocusFBLockManager.mm \
+            src/FocusFBAdBlocker.mm \
             -lobjc \
             -framework Foundation \
             -framework CoreFoundation \
@@ -145,35 +138,34 @@ jobs:
             -framework AVFoundation \
             -framework CoreImage \
             -weak_framework CoreNFC \
-            -o "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+            -o dist/FocusFB.dylib
 
-          ldid -S "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+          ldid -S dist/FocusFB.dylib
+          otool -L dist/FocusFB.dylib
+          python3 scripts/verify_dylib.py dist/FocusFB.dylib
 
-          echo "--- Dipendenze dinamiche (otool -L) ---"
-          otool -L "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
-
-          python3 "$PROJECT_ROOT/scripts/verify_dylib.py" "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
-
-      - name: Crea pacchetto .deb v2.2 (per Feather / Sileo / cyan)
+      - name: Package .deb
         run: |
           set -euo pipefail
+          VERSION="$(awk -F': ' '/^Version:/ {print $2}' control | tr -d '[:space:]')"
           PKG_ROOT="$RUNNER_TEMP/deb_stage"
           rm -rf "$PKG_ROOT"
           mkdir -p "$PKG_ROOT/DEBIAN" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries"
 
-          cp "$GITHUB_WORKSPACE/dist/FocusFB.dylib" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
-          cp "$PROJECT_ROOT/FocusFB.plist" "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
-          cp "$PROJECT_ROOT/control" "$PKG_ROOT/DEBIAN/control"
+          cp dist/FocusFB.dylib "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
+          cp FocusFB.plist "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
+          cp control "$PKG_ROOT/DEBIAN/control"
 
           chmod -R 0755 "$PKG_ROOT/DEBIAN"
           chmod 0755 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.dylib"
           chmod 0644 "$PKG_ROOT/Library/MobileSubstrate/DynamicLibraries/FocusFB.plist"
 
-          dpkg-deb -Zgzip --root-owner-group -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_2.2.0_iphoneos-arm64.deb" \
-            || dpkg-deb -Zgzip -b "$PKG_ROOT" "$GITHUB_WORKSPACE/dist/com.focusfb.tweak_2.2.0_iphoneos-arm64.deb"
+          DEB_OUT="dist/com.focusfb.tweak_${VERSION}_iphoneos-arm64.deb"
+          dpkg-deb -Zgzip --root-owner-group -b "$PKG_ROOT" "$DEB_OUT" \
+            || dpkg-deb -Zgzip -b "$PKG_ROOT" "$DEB_OUT"
 
-      - name: Scarica IPA e inietta FocusFB v2.2 con cyan (se ipa_url o Variable IPA_URL presente)
-        if: ${{ inputs.ipa_url != '' || vars.IPA_URL != '' }}
+      - name: Inject into personal IPA (workflow_dispatch or vars.IPA_URL)
+        if: ${{ github.event_name == 'workflow_dispatch' && (inputs.ipa_url != '' || vars.IPA_URL != '') }}
         env:
           INPUT_IPA_URL: ${{ inputs.ipa_url || vars.IPA_URL }}
           INPUT_DISPLAY_NAME: ${{ inputs.display_name || 'Facebook' }}
@@ -190,37 +182,26 @@ jobs:
           fi
 
           if [[ "$URL_TO_FETCH" == *"drive.google.com"* ]]; then
-            echo "Rilevato link Google Drive: download tramite gdown --fuzzy..."
             pipx run gdown --fuzzy "$URL_TO_FETCH" -O "$IPA_IN"
           else
-            echo "Download diretto dell'IPA con curl..."
             curl --fail --location --retry 3 --retry-delay 2 "$URL_TO_FETCH" -o "$IPA_IN"
           fi
 
-          MIME_TYPE="$(file --mime-type -b "$IPA_IN")"
-          if [[ "$MIME_TYPE" != "application/zip" && "$MIME_TYPE" != "application/x-ios-app" && "$MIME_TYPE" != "application/octet-stream" ]]; then
-            echo "::error::Il link fornito non ha scaricato un file IPA valido (tipo rilevato: $MIME_TYPE). Assicurati che sia un link di download diretto e pubblico."
-            exit 1
-          fi
-
-          if ! unzip -tq "$IPA_IN" >/dev/null; then
-            echo "::error::Il file scaricato non e' un archivio IPA/ZIP integro."
-            exit 1
-          fi
+          unzip -tq "$IPA_IN" >/dev/null
 
           MERGE_PLIST="$RUNNER_TEMP/focusfb_info_merge.plist"
-          python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scansione chiave NFC per sbloccare FocusFB"}, open(sys.argv[1], "wb"))' "$MERGE_PLIST"
+          python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scan NFC tag to unlock FocusFB"}, open(sys.argv[1], "wb"))' "$MERGE_PLIST"
 
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
           CYAN_ARGS=(
             -i "$IPA_IN"
-            -o "$GITHUB_WORKSPACE/dist/FocusFB_Patched.ipa"
+            -o "dist/FocusFB_Patched.ipa"
             -u -w -q -s --overwrite
             -n "$INPUT_DISPLAY_NAME"
             -b "$INPUT_BUNDLE_ID"
             -l "$MERGE_PLIST"
-            -f "$GITHUB_WORKSPACE/dist/FocusFB.dylib"
+            -f "dist/FocusFB.dylib"
           )
 
           if [[ "$INPUT_REMOVE_EXT" == "true" ]]; then
@@ -228,41 +209,23 @@ jobs:
           fi
 
           cyan "${CYAN_ARGS[@]}"
-          unzip -tq "$GITHUB_WORKSPACE/dist/FocusFB_Patched.ipa" >/dev/null
-          ls -lh "$GITHUB_WORKSPACE/dist/"
+          unzip -tq "dist/FocusFB_Patched.ipa" >/dev/null
 
-      - name: Riepilogo Build FocusFB v2.2
-        run: |
-          {
-            echo "## ✅ FocusFB v2.2 Compilato con Successo!"
-            echo ""
-            echo "### File generati in \`FocusFB-v2.2-Output\`:"
-            for f in "$GITHUB_WORKSPACE/dist/"*; do
-              echo "- \`$(basename "$f")\` ($(du -h "$f" | cut -f1))"
-            done
-            echo ""
-            if [[ ! -f "$GITHUB_WORKSPACE/dist/FocusFB_Patched.ipa" ]]; then
-              echo "> **Nota IPA:** Questa build è partita via \`push\` senza URL IPA, quindi contiene \`FocusFB.dylib\` (per **LiveContainer** / iniezione manuale in **Feather**) e il \`.deb\`."
-              echo "> Se vuoi scaricare direttamente \`FocusFB_Patched.ipa\` già iniettata per SideStore/Feather, premi **Run workflow** in alto a destra e incolla l'URL dell'IPA decrittata!"
-            fi
-            echo ""
-            echo "**Verifica sull'iPhone:** Aprendo le Impostazioni FocusFB (2 dita premute per 0,6s), in alto vedrai scritto **\`FocusFB 2.2\`** con il badge verde **\`🛡️ AdBlock ON\`**."
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Carica Artifacts scaricabili nella pagina Actions
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: FocusFB-v2.2-Output
+          name: FocusFB-Build
           path: dist/*
           if-no-files-found: error
           retention-days: 30
 
-      - name: Crea Draft Release su GitHub (se abilitato da workflow_dispatch)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_draft_release == true }}
-        continue-on-error: true
+      - name: Publish GitHub Release (dylib + deb only)
+        if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_public_release == true) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: focusfb-v2.2-run-${{ github.run_number }}
-          name: FocusFB v2.2 Build #${{ github.run_number }}
-          files: dist/*
-          draft: true
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.4.0' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'FocusFB v2.4.0' }}
+          files: |
+            dist/FocusFB.dylib
+            dist/*.deb
+          generate_release_notes: true
