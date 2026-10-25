@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Script per compilazione locale su macOS (opzionale — non necessario se usi GitHub Actions)
-# Uso:
-#   ./scripts/build_macos.sh                              -> genera solo dist/FocusFB.dylib + .deb
-#   ./scripts/build_macos.sh /percorso/Facebook.ipa       -> genera anche dist/FocusFB_Patched.ipa
+# Build FocusFB.dylib on macOS using Xcode iOS SDK (no Theos / Substrate required)
+# Usage:
+#   ./scripts/build_macos.sh                        -> builds dist/FocusFB.dylib
+#   ./scripts/build_macos.sh /path/to/Facebook.ipa  -> also injects dist/FocusFB_Patched.ipa
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="${PROJECT_DIR}/dist"
@@ -15,63 +15,64 @@ BUNDLE_ID="${BUNDLE_ID:-com.facebook.Facebook}"
 mkdir -p "${DIST_DIR}"
 
 if ! command -v ldid >/dev/null 2>&1; then
-  echo "[*] Installazione dipendenze Homebrew (make, ldid-procursus, dpkg)..."
-  brew install make ldid-procursus dpkg
+  brew install ldid-procursus || brew install ldid
 fi
 
-if [[ -d "$(brew --prefix make 2>/dev/null)/libexec/gnubin" ]]; then
-  export PATH="$(brew --prefix make)/libexec/gnubin:${PATH}"
-fi
+SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+echo "[*] Building FocusFB.dylib (arm64) with iOS SDK: ${SDK_PATH}"
 
-if [[ -z "${THEOS:-}" ]]; then
-  export THEOS="${PROJECT_DIR}/.theos_toolchain"
-fi
+xcrun --sdk iphoneos clang++ \
+  -isysroot "${SDK_PATH}" \
+  -target arm64-apple-ios15.0 \
+  -dynamiclib \
+  -std=gnu++17 \
+  -fobjc-arc \
+  -fobjc-exceptions \
+  -fobjc-call-cxx-cdtors \
+  -O2 \
+  -Wno-deprecated-declarations \
+  -Wno-undeclared-selector \
+  -install_name "@rpath/FocusFB.dylib" \
+  -I"${PROJECT_DIR}/src" \
+  "${PROJECT_DIR}/src/Tweak.mm" \
+  "${PROJECT_DIR}/src/FocusFBFishhook.mm" \
+  "${PROJECT_DIR}/src/FocusFBPrefs.mm" \
+  "${PROJECT_DIR}/src/FocusFBSideloadFix.mm" \
+  "${PROJECT_DIR}/src/FocusFBTabManager.mm" \
+  "${PROJECT_DIR}/src/FocusFBSettingsViewController.mm" \
+  "${PROJECT_DIR}/src/FocusFBLockManager.mm" \
+  "${PROJECT_DIR}/src/FocusFBAdBlocker.mm" \
+  -lobjc \
+  -framework Foundation \
+  -framework CoreFoundation \
+  -framework UIKit \
+  -framework QuartzCore \
+  -framework CoreGraphics \
+  -framework Security \
+  -framework AVFoundation \
+  -framework CoreImage \
+  -weak_framework CoreNFC \
+  -o "${DIST_DIR}/FocusFB.dylib"
 
-if [[ ! -d "${THEOS}/makefiles" ]]; then
-  echo "[*] Clonazione Theos..."
-  git clone --depth 1 --recurse-submodules https://github.com/theos/theos.git "${THEOS}"
-fi
-
-echo "[*] Compilazione FocusFB.dylib (arm64, iOS 15.0+)..."
-make -C "${PROJECT_DIR}" ARCHS=arm64 FINALPACKAGE=1 clean all
-
-DYLIB_SRC=""
-for candidate in \
-  "${PROJECT_DIR}/.theos/obj/arm64/FocusFB.dylib" \
-  "${PROJECT_DIR}/.theos/obj/FocusFB.dylib" \
-  "${PROJECT_DIR}/.theos/obj/debug/arm64/FocusFB.dylib" \
-  "${PROJECT_DIR}/.theos/obj/debug/FocusFB.dylib"; do
-  if [[ -f "${candidate}" ]]; then
-    DYLIB_SRC="${candidate}"
-    break
-  fi
-done
-
-if [[ -z "${DYLIB_SRC}" ]]; then
-  echo "[ERRORE] FocusFB.dylib non trovato dopo la compilazione!"
-  exit 1
-fi
-
-cp "${DYLIB_SRC}" "${DIST_DIR}/FocusFB.dylib"
-install_name_tool -id "@rpath/FocusFB.dylib" "${DIST_DIR}/FocusFB.dylib"
 ldid -S "${DIST_DIR}/FocusFB.dylib"
-
 python3 "${PROJECT_DIR}/scripts/verify_dylib.py" "${DIST_DIR}/FocusFB.dylib"
 
 if [[ -n "${INPUT_IPA}" ]]; then
   if ! command -v cyan >/dev/null 2>&1; then
-    echo "[*] Installazione cyan (pyzule-rw)..."
     pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
   fi
-  echo "[*] Iniezione di FocusFB.dylib nell'IPA..."
+  MERGE_PLIST="${DIST_DIR}/focusfb_info_merge.plist"
+  python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scan NFC tag to unlock FocusFB"}, open(sys.argv[1], "wb"))' "${MERGE_PLIST}"
   cyan -i "${INPUT_IPA}" \
        -o "${DIST_DIR}/FocusFB_Patched.ipa" \
        -u -w -e -q -s --overwrite \
        -n "${DISPLAY_NAME}" \
        -b "${BUNDLE_ID}" \
+       -l "${MERGE_PLIST}" \
        -f "${DIST_DIR}/FocusFB.dylib"
-  echo "[OK] IPA generata in: ${DIST_DIR}/FocusFB_Patched.ipa"
+  rm -f "${MERGE_PLIST}"
+  echo "[OK] Patched IPA written to: ${DIST_DIR}/FocusFB_Patched.ipa"
 fi
 
-echo "[OK] Build completata in: ${DIST_DIR}"
+echo "[OK] Output in: ${DIST_DIR}"
 ls -lh "${DIST_DIR}"

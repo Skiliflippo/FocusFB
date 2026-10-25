@@ -9,6 +9,8 @@ extern "C" {
 void FocusFBStartEngine(void);
 void FocusFBRefreshUIImmediately(void);
 void FocusFBNavigateToMarketplace(BOOL allowDeepLinkFallback);
+void FocusFBForceSwitchToMarketplaceNow(void);
+BOOL FocusFBIsUserCurrentlyInMarketplace(void);
 void FocusFBShowToast(NSString *message, NSString *sfSymbolName);
 UIWindow * _Nullable FocusFBActiveWindow(void);
 UIViewController * _Nullable FocusFBTopMostViewController(void);

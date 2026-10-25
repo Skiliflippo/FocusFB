@@ -1,49 +1,54 @@
-# FocusFB — Facebook senza distrazioni per iOS (Marketplace-Only & Tab Filter)
+# FocusFB
 
-**FocusFB** è un tweak nativo iOS (`arm64`, zero dipendenze da `CydiaSubstrate` o `ElleKit`) progettato per l'ultima versione di **Facebook** (inclusa la nuova barra flottante `FBFloatingTabBar` introdotta su Facebook v575–580+ e la `FBTabBar` classica), installabile senza jailbreak su **iOS 15 – iOS 26.6+** tramite **SideStore**, **Feather** o **LiveContainer**.
+An open-source iOS tweak for Facebook focused on removing distractions, blocking ads, and keeping Marketplace usable without the endless feed.
 
-Nasce per risolvere un problema concreto: aprire Facebook con un obiettivo preciso (ad esempio cercare o vendere un oggetto sul **Marketplace**) e ritrovarsi 20 minuti dopo intrappolati tra **Reels** e post algoritmici nel **News Feed**.
+Works on non-jailbroken devices (SideStore, Feather, AltStore, LiveContainer) and jailbroken setups (`.deb`). Zero dependency on CydiaSubstrate.
 
----
+## Features
 
-## Caratteristiche principali
+- **Custom Tabs & Full-Screen Marketplace**: Hide Home, Reels, Stories, Friends, or Groups. Defaults to Marketplace-only and removes the bottom bar completely when a single tab is kept.
+- **Ad Blocker**: Blocks sponsored listings in Marketplace (Home, search, categories) as well as ads and suggested posts in the Feed.
+- **Physical Key Lock (Foqos-style)**:
+  - Pair any physical QR code, product barcode, or NFC tag.
+  - **Dual scope**: keep *Marketplace always open* while limiting the rest of Facebook to a set session/daily timer, or lock the entire app.
+  - **Emergency Unlock**: up to 3 emergency unlocks per month if you don't have your physical key with you.
+- **Sideload Fixes Included**: Fixes Facebook keychain token refresh (`-34018`) to prevent repeated logouts on sideloaded builds.
 
-- **Modalità "Solo Marketplace" attiva di default**: al primo avvio nasconde tutti i tab distraenti (Home, Reels/Watch, Amici, Gruppi, Notifiche, Profilo, Menu), lasciando visibile e centrato solo il **Marketplace**.
-- **Selettore Tab granulare in tempo reale**: pannello impostazioni nativo iOS (`InsetGrouped`, in Italiano e Inglese) in cui decidere con singoli interruttori quali tab vedere sulla barra.
-- **Avvio diretto sul Marketplace**: salta automaticamente il News Feed all'apertura dell'app (tramite attivazione nativa del tab + fallback in-process `fb://marketplace` che non rimbalza mai sull'app ufficiale).
-- **Scudo Anti-Feed & Blocco Reels ovunque**:
-  - Se il tab Home è disattivato, oscura il News Feed e mette in pausa eventuali video in autoplay nel caso Facebook tenti comunque di mostrarlo.
-  - Blocca l'apertura a schermo intero del player verticale dei Reels/Watch anche cliccando link o suggerimenti.
-  - Nasconde la barra delle Storie e i caroselli Reels inline.
-- **Ispettore Live dei Tab**: elenca tutti i tab effettivamente presenti nella tua versione di Facebook con possibilità di forzare `Mostra` / `Nascondi` su singoli elementi futuri (es. nuovi tab sperimentali aggiunti da Meta).
-- **Fix Sideloading integrati**: gestione automatica del Keychain (`accessGroup`), fallback `AppGroups` (`FakeGroupContainers`) e protezione crash entitlement Siri quando l'IPA è firmata con Apple ID gratuito (SideStore) o certificato di terze parti (Feather).
+## Opening FocusFB Settings
 
----
+Inside Facebook:
+- Hold **2 fingers** anywhere on the screen for 0.6 seconds, or
+- Long-press any visible tab on the bottom navigation bar.
 
-## Come aprire le Impostazioni FocusFB dentro l'app
+## Installation
 
-1. **Pressione prolungata (Long Press)** sul tab **Marketplace** (o qualsiasi altro tab visibile) → apre il menu rapido nativo (*Impostazioni FocusFB*, *Vai a Marketplace*, *Solo Marketplace / Mostra Tutti*).
-2. **Pressione prolungata** su un punto vuoto della barra inferiore di Facebook.
-3. **Pressione prolungata con 2 dita (0,6 secondi)** in qualsiasi punto dello schermo (utile anche se scegli di nascondere l'intera barra inferiore!).
+Grab `FocusFB.dylib` or the `.deb` package from [**Releases**](../../releases).
 
----
+- **LiveContainer**: Place `FocusFB.dylib` inside your Facebook app container's Tweaks folder and enable tweak injection.
+- **Feather / ESign / Sideloadly**: Import your own decrypted Facebook `.ipa`, add `FocusFB.dylib` (or `.deb`) under Tweaks/Dylibs, sign, and install.
+- **GitHub Actions (Fork)**:
+  1. Fork this repository.
+  2. Go to **Actions → Build FocusFB → Run workflow**.
+  3. Optionally paste a direct link to your own decrypted `.ipa` in `ipa_url` to generate an injected `.ipa` in your private workflow artifacts.
 
-## Struttura del progetto
+> **Note on Passkeys when sideloaded**: iOS binds WebAuthn Passkeys to Meta's official Apple Team ID (`associated-domains`). On any sideloaded Facebook build, tap *"Try another way"* during login and confirm with a 2FA code (Authenticator app / SMS) or another logged-in device.
 
-```text
-FocusFB/
-├── .github/workflows/build.yml        # Build automatica Cloud (macOS): genera .ipa, .dylib e .deb
-├── src/
-│   ├── Tweak.mm                       # Entrypoint constructor e rilevamento processo Facebook
-│   ├── FocusFBPrefs.h / .mm           # Preferenze, preset, localizzazione IT/EN e registro tab live
-│   ├── FocusFBSideloadFix.h / .mm     # Fix Keychain, AppGroups e Siri per SideStore/Feather/LiveContainer
-│   ├── FocusFBTabManager.h / .mm      # Hook FBFloatingTabBar/FBTabBar, reflow tab, redirect Marketplace e scudi
-│   └── FocusFBSettingsViewController.h / .mm  # Pannello impostazioni iOS nativo
-├── scripts/
-│   ├── verify_dylib.py                # Verifica automatica binario Mach-O arm64 e assenza Substrate
-│   └── build_macos.sh                 # Script opzionale per compilazione locale su Mac
-├── Makefile                           # Build Theos library.mk (arm64, iOS 15.0+)
-└── GUIDA_COMPLETA_IT.md               # Istruzioni passo-passo per GitHub Actions, SideStore, Feather e LiveContainer
+## Building Locally (macOS)
+
+Requires Xcode Command Line Tools / iOS SDK and `ldid` (`brew install ldid`):
+
+```bash
+git clone https://github.com/Skiliflippo/FocusFB.git
+cd FocusFB
+make
 ```
 
-Consulta **[GUIDA_COMPLETA_IT.md](./GUIDA_COMPLETA_IT.md)** per tutti i passaggi dettagliati di compilazione cloud e installazione su iPhone.
+The compiled binary will be generated at `dist/FocusFB.dylib`.
+
+## Support
+
+If FocusFB saves you time, you can support its development via [PayPal](https://paypal.me/Skiliflippo).
+
+## Disclaimer & License
+
+FocusFB is an independent open-source tweak released under the [MIT License](LICENSE). This project does **not** distribute any proprietary binaries owned by Meta Platforms, Inc., and is not affiliated with, endorsed by, or sponsored by Meta Platforms, Inc. Facebook and Marketplace are trademarks of Meta Platforms, Inc.

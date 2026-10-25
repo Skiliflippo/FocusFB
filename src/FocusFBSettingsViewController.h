@@ -5,6 +5,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface FocusFBSettingsViewController : UIViewController
 
 + (void)presentFromTopMostController;
++ (void)presentPreUnlockedFromTopController;
 + (void)presentWelcomeIfNeeded;
 
 @end

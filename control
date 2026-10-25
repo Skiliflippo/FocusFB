@@ -1,8 +1,8 @@
 Package: com.focusfb.tweak
 Name: FocusFB
-Version: 1.0.0
+Version: 2.4.0
 Architecture: iphoneos-arm64
-Description: Filtro Tab e modalita Solo Marketplace per Facebook iOS (compatibile con SideStore, Feather e LiveContainer)
-Maintainer: FocusFB
-Author: FocusFB
+Description: Distraction-free Facebook for iOS: Marketplace-only mode, ad blocker, and physical QR/NFC lock.
+Maintainer: Skiliflippo
+Author: Skiliflippo
 Section: Tweaks

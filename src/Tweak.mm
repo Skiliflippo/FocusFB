@@ -5,6 +5,8 @@
 #import "FocusFBPrefs.h"
 #import "FocusFBSideloadFix.h"
 #import "FocusFBTabManager.h"
+#import "FocusFBLockManager.h"
+#import "FocusFBAdBlocker.h"
 
 static BOOL FocusFBShouldActivateInCurrentProcess(void) {
     NSBundle *mainBundle = [NSBundle mainBundle];
@@ -40,26 +42,30 @@ static void FocusFBConstructor(void) {
         }
 
         os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO,
-                         "[FocusFB] Loaded in bundle=%{public}@ iOS=%{public}@",
+                         "[FocusFB 2.0] Loaded in bundle=%{public}@ iOS=%{public}@",
                          NSBundle.mainBundle.bundleIdentifier ?: @"-",
                          UIDevice.currentDevice.systemVersion);
 
-        // Inizializza preferenze di default ("Solo Marketplace" attivo al primo avvio)
-        (void)[FocusFBPrefs shared];
-
-        // Applica fix Keychain / AppGroups per Sideloading (SideStore, Feather, LiveContainer)
+        // 1. Applica subito i fix Keychain / AppGroups per Sideloading (SideStore, Feather, LiveContainer)
         FocusFBInstallSideloadFixesIfNeeded();
 
-        // Avvia il motore UI sia su DidFinishLaunching sia su main queue (supporta anche late-loading)
+        // 2. Inizializza preferenze, AdBlock (attivo fin dal primo pacchetto GraphQL/Pando) e Blocco Rigoroso Foqos
+        (void)[FocusFBPrefs shared];
+        FocusFBInstallAdBlocker();
+        (void)[FocusFBLockManager shared];
+
+        // 3. Avvia il motore UI e il timer limiti sia su DidFinishLaunching sia su main queue
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(__unused NSNotification *note) {
             FocusFBStartEngine();
+            [[FocusFBLockManager shared] start];
         }];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             FocusFBStartEngine();
+            [[FocusFBLockManager shared] start];
         });
     }
 }

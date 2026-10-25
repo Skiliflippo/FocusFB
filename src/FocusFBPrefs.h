@@ -51,7 +51,9 @@ typedef NS_ENUM(NSInteger, FocusFBOverrideMode) {
 @property (nonatomic, assign) BOOL showMenuTab;
 @property (nonatomic, assign) BOOL hideUnknownTabs;
 
-// Protezioni Anti-Distrazione & Layout
+// Protezioni Anti-Distrazione, AdBlock & Layout
+@property (nonatomic, assign) BOOL blockAllAds;
+@property (nonatomic, assign) BOOL hideSuggestedClutter;
 @property (nonatomic, assign) BOOL startOnMarketplace;
 @property (nonatomic, assign) BOOL shieldHomeFeed;
 @property (nonatomic, assign) BOOL blockReelsEverywhere;
