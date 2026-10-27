@@ -19,7 +19,7 @@ if ! command -v ldid >/dev/null 2>&1; then
 fi
 
 SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-echo "[*] Building FocusFB.dylib v2.5 (arm64) with iOS SDK: ${SDK_PATH}"
+echo "[*] Building FocusFB.dylib v2.5.1 (arm64) with iOS SDK: ${SDK_PATH}"
 
 xcrun --sdk iphoneos clang++ \
   -isysroot "${SDK_PATH}" \
@@ -52,9 +52,9 @@ xcrun --sdk iphoneos clang++ \
   -framework CoreGraphics \
   -framework Security \
   -framework AVFoundation \
-  -framework CoreMedia \
   -framework CoreImage \
-  -framework Photos \
+  -weak_framework CoreMedia \
+  -weak_framework Photos \
   -weak_framework CoreNFC \
   -o "${DIST_DIR}/FocusFB.dylib"
 

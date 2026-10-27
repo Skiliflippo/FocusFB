@@ -37,6 +37,17 @@ static BOOL FocusFBShouldActivateInCurrentProcess(void) {
     return NO;
 }
 
+static void FocusFBBootstrapAfterLaunch(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        FocusFBInstallAdBlocker();
+        FocusFBStartEngine();
+        [[FocusFBLockManager shared] start];
+        FocusFBInstallStoriesManager();
+        FocusFBInstallMediaDownloader();
+    });
+}
+
 __attribute__((constructor))
 static void FocusFBConstructor(void) {
     @autoreleasepool {
@@ -50,28 +61,20 @@ static void FocusFBConstructor(void) {
                          NSBundle.mainBundle.bundleIdentifier ?: @"-",
                          UIDevice.currentDevice.systemVersion);
 
-        // 1. Applica subito i fix Keychain / AppGroups per Sideloading (SideStore, Feather, LiveContainer)
+        // 1. Nel constructor dyld esegui SOLO i fix Keychain/AppGroups e le preferenze (100% identico alla v2.4!)
         FocusFBInstallSideloadFixesIfNeeded();
-
-        // 2. Inizializza preferenze, AdBlock + Pulizia Feed, Storie Incognito, Media Downloader e Blocco Foqos
         (void)[FocusFBPrefs shared];
-        FocusFBInstallAdBlocker();
-        FocusFBInstallStoriesManager();
-        FocusFBInstallMediaDownloader();
-        (void)[FocusFBLockManager shared];
 
-        // 3. Avvia il motore UI e il timer limiti sia su DidFinishLaunching sia su main queue
+        // 2. Avvia tutti gli altri moduli SOLO dopo l'inizializzazione di UIApplication sul main thread
         [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
                                                       usingBlock:^(__unused NSNotification *note) {
-            FocusFBStartEngine();
-            [[FocusFBLockManager shared] start];
+            FocusFBBootstrapAfterLaunch();
         }];
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            FocusFBStartEngine();
-            [[FocusFBLockManager shared] start];
+            FocusFBBootstrapAfterLaunch();
         });
     }
 }

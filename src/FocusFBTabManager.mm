@@ -2,6 +2,7 @@
 #import "FocusFBPrefs.h"
 #import "FocusFBSettingsViewController.h"
 #import "FocusFBLockManager.h"
+#import "FocusFBAdBlocker.h"
 #import "FocusFBStoriesManager.h"
 #import "FocusFBMediaDownloader.h"
 
@@ -633,57 +634,24 @@ static void FFBSyncFloatingGearButton(UIWindow *window) {
 @implementation FFBCachedNavbarPass
 @end
 
-// Clamping pre-super sul container principale (zero oscillazioni 769pt <-> 852pt e zero saltelli scroll!)
-static void FFBFullScreenContainer_setFrame(UIView *self, SEL _cmd, CGRect frame) {
-    if (gForceFullScreenSingleBar) {
-        UIView *superview = self.superview;
-        if (superview) {
-            CGFloat parentH = CGRectGetHeight(superview.bounds);
-            CGFloat parentW = CGRectGetWidth(superview.bounds);
-            if (parentH > 320.0 &&
-                CGRectGetMinY(frame) <= 24.0 &&
-                fabs(CGRectGetWidth(frame) - parentW) <= 6.0) {
-                CGFloat missingBottom = parentH - CGRectGetMaxY(frame);
-                if (missingBottom >= 34.0 && missingBottom <= 145.0) {
-                    frame.size.height = parentH - CGRectGetMinY(frame);
-                }
-            }
+static BOOL FFBSubtreeHasActiveScrollingView(UIView *node, NSUInteger depth) {
+    if (!node || depth > 7 || node.hidden || node.alpha <= 0.01) return NO;
+    if ([node isKindOfClass:UIScrollView.class]) {
+        UIScrollView *sv = (UIScrollView *)node;
+        if (sv.isTracking || sv.isDragging || sv.isDecelerating) {
+            return YES;
         }
     }
-    struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
-    ((void (*)(struct objc_super *, SEL, CGRect))objc_msgSendSuper)(&sup, _cmd, frame);
-}
-
-static void FFBEnsureFullScreenContainerSubclass(UIView *node) {
-    if (!node || [node isKindOfClass:UIScrollView.class]) return;
-    Class origCls = object_getClass(node);
-    NSString *origName = NSStringFromClass(origCls) ?: @"";
-    if (origName.length == 0 ||
-        [origName hasPrefix:@"FFBFullScreenContainer_"] ||
-        [origName hasPrefix:@"NSKVONotifying_"] ||
-        FFBIsFacebookNavbarView(node) ||
-        [node isKindOfClass:UITabBar.class]) {
-        return;
-    }
-
-    NSString *subName = [@"FFBFullScreenContainer_" stringByAppendingString:origName];
-    Class subCls = objc_getClass(subName.UTF8String);
-    if (!subCls) {
-        subCls = objc_allocateClassPair(origCls, subName.UTF8String, 0);
-        if (subCls) {
-            class_addMethod(subCls,
-                            @selector(setFrame:),
-                            (IMP)FFBFullScreenContainer_setFrame,
-                            "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
-            objc_registerClassPair(subCls);
+    for (UIView *sub in node.subviews) {
+        if (FFBSubtreeHasActiveScrollingView(sub, depth + 1)) {
+            return YES;
         }
     }
-    if (subCls) {
-        object_setClass(node, subCls);
-    }
+    return NO;
 }
 
-// Espande i container strutturali fino alla UIScrollView SENZA MAI toccare contentInset durante lo scroll!
+// Espande i container strutturali fino alla UIScrollView SENZA object_setClass e SENZA MAI toccare
+// frame o contentInset durante uno scroll attivo!
 static void FFBExpandClippedContentTree(UIView *node,
                                         CGFloat targetBottomHeight,
                                         CGFloat screenH,
@@ -704,7 +672,6 @@ static void FFBExpandClippedContentTree(UIView *node,
     CGFloat minY = CGRectGetMinY(node.frame);
     CGFloat curH = CGRectGetHeight(node.frame);
     if (minY <= 24.0 && curH > screenH * 0.48) {
-        FFBEnsureFullScreenContainerSubclass(node);
         CGFloat desiredH = targetBottomHeight - minY;
         if (curH < desiredH - 0.5 && (desiredH - curH) <= 145.0) {
             CGRect f = node.frame;
@@ -809,8 +776,9 @@ static void FFBSetEntireBottomBarHidden(UIView *bar, BOOL hideEntirely) {
                 continue;
             }
 
-            // Contenitore principale della schermata attiva (es. Marketplace)
-            if (sibH > screenH * 0.48 && sibMinY <= 24.0) {
+            // Contenitore principale della schermata attiva (es. Marketplace):
+            // espandi solo a riposo, mai durante uno scroll attivo!
+            if (sibH > screenH * 0.48 && sibMinY <= 24.0 && !FFBSubtreeHasActiveScrollingView(sib, 0)) {
                 FFBExpandClippedContentTree(sib, hostH, screenH, safeBottom, 0);
             }
         }
@@ -1816,10 +1784,12 @@ static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
 
     // Installa hook su classi caricate pigramente da Facebook
     FFBInstallDynamicHooksAvailableNow();
+    FocusFBRetryLazyAdHooksIfNeeded();
+    FocusFBNotifyStoryCandidateController(vc);
 
     if ([clsName hasPrefix:@"FB"] || [clsName hasPrefix:@"META"] ||
         [clsName hasPrefix:@"MDS"] || [clsName hasPrefix:@"CDS"] ||
-        [clsName hasPrefix:@"RCT"]) {
+        [clsName hasPrefix:@"RCT"] || [clsName hasPrefix:@"LS"]) {
         FFBApplyControllerProtection(vc);
         [[FocusFBLockManager shared] refreshEnforcementUI];
         FocusFBMediaDownloaderSyncUI();

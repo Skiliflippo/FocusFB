@@ -6,56 +6,103 @@
 #import <CoreMedia/CoreMedia.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#include <mach-o/dyld.h>
 #include <os/lock.h>
 #include <atomic>
-#include <unordered_map>
 #include <unordered_set>
 #include <string>
 
 typedef void (*FFBAppSendEventIMP)(id, SEL, UIEvent *);
 typedef NSURLSessionDataTask *(*FFBSessionTaskReqIMP)(id, SEL, NSURLRequest *);
 typedef NSURLSessionDataTask *(*FFBSessionTaskReqCompIMP)(id, SEL, NSURLRequest *, void (^)(NSData *, NSURLResponse *, NSError *));
-typedef void (*FFBStoryTrampolineIMP)(id, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t, uintptr_t, double, double, double, double);
 
-static FFBAppSendEventIMP       gOrigAppSendEvent      = NULL;
-static FFBSessionTaskReqIMP     gOrigDataTaskReq       = NULL;
-static FFBSessionTaskReqCompIMP gOrigDataTaskReqComp   = NULL;
+static FFBAppSendEventIMP       gOrigAppSendEvent    = NULL;
+static FFBSessionTaskReqIMP     gOrigDataTaskReq     = NULL;
+static FFBSessionTaskReqCompIMP gOrigDataTaskReqComp = NULL;
 
 static BOOL gInstalledSendEventHook   = NO;
 static BOOL gInstalledURLSessionHooks = NO;
+static BOOL gStoriesReadyAfterActive  = NO;
 
 static std::atomic<double> gLastUserTouchTime{0.0};
-
-struct FFBClassSelKey {
-    Class cls;
-    SEL sel;
-    bool operator==(const FFBClassSelKey &o) const noexcept {
-        return cls == o.cls && sel == o.sel;
-    }
-};
-
-struct FFBClassSelHash {
-    size_t operator()(const FFBClassSelKey &k) const noexcept {
-        size_t h1 = reinterpret_cast<uintptr_t>(k.cls);
-        size_t h2 = reinterpret_cast<uintptr_t>(k.sel);
-        return h1 ^ (h2 * 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
-    }
-};
-
 static os_unfair_lock gStoryHookLock = OS_UNFAIR_LOCK_INIT;
-static std::unordered_map<FFBClassSelKey, IMP, FFBClassSelHash> gOrigStoryIMPs;
-static std::unordered_set<std::string> gScannedImagePaths;
+static std::unordered_set<std::string> gHookedSnacksClasses;
+static std::unordered_set<std::string> gHookedClassSelPairs;
+
+static NSTimer *gActiveStoryLoopTimer = nil;
 
 double FocusFBLastUserTouchTimestamp(void) {
     return gLastUserTouchTime.load(std::memory_order_relaxed);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Rilevamento Visualizzatore Storie Attivo + Loop Video a Fine Riproduzione
+// 1. NSURLProtocol Isolato che emette un vero NSHTTPURLResponse 200 in memoria
 // ─────────────────────────────────────────────────────────────────────────────
 
-static BOOL FFBViewOrControllerLooksLikeStoryViewer(NSString *clsName) {
+@interface FFBStoryIncognitoURLProtocol : NSURLProtocol
+@end
+
+@implementation FFBStoryIncognitoURLProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    NSString *scheme = request.URL.scheme.lowercaseString;
+    return [scheme isEqualToString:@"focusfb-incognito"];
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSURL *origURL = [NSURL URLWithString:@"https://graph.facebook.com/graphql"];
+    NSDictionary<NSString *, NSString *> *headers = @{
+        @"Content-Type": @"application/json; charset=utf-8"
+    };
+    NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:origURL
+                                                          statusCode:200
+                                                         HTTPVersion:@"HTTP/1.1"
+                                                        headerFields:headers];
+    NSData *payload = [@"{\"data\":{},\"extensions\":{\"is_final\":true}}" dataUsingEncoding:NSUTF8StringEncoding];
+    id<NSURLProtocolClient> client = self.client;
+    [client URLProtocol:self didReceiveResponse:resp cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    if (payload) {
+        [client URLProtocol:self didLoadData:payload];
+    }
+    [client URLProtocolDidFinishLoading:self];
+}
+
+- (void)stopLoading {
+}
+
+@end
+
+static NSURLSession *FFBIsolatedStoryMockSession(void) {
+    static NSURLSession *mockSession = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.protocolClasses = @[FFBStoryIncognitoURLProtocol.class];
+        cfg.URLCache = nil;
+        cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        mockSession = [NSURLSession sessionWithConfiguration:cfg];
+    });
+    return mockSession;
+}
+
+static NSURLRequest *FFBIsolatedStoryMockRequest(void) {
+    static NSURLRequest *req = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURL *u = [NSURL URLWithString:@"focusfb-incognito://graphql/story-seen-ok"];
+        req = [NSURLRequest requestWithURL:u];
+    });
+    return req;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Rilevamento Visualizzatore Storie Attivo + Loop Video prima della Fine
+// ─────────────────────────────────────────────────────────────────────────────
+
+static BOOL FFBControllerNameLooksLikeStoryViewer(NSString *clsName) {
     if (clsName.length == 0) return NO;
     NSString *lower = clsName.lowercaseString;
     if ([lower containsString:@"storiestray"] ||
@@ -63,19 +110,19 @@ static BOOL FFBViewOrControllerLooksLikeStoryViewer(NSString *clsName) {
         [lower containsString:@"traycell"]) {
         return NO;
     }
+    // Nota: in Facebook iOS le Storie 24h usano il prefisso FBSnacks* (mai FBStory* che è il Feed)
     return ([lower hasPrefix:@"fbsnacks"] ||
             [lower containsString:@"snacksbucket"] ||
             [lower containsString:@"snacksviewer"] ||
             [lower containsString:@"snacksmedia"] ||
             [lower hasPrefix:@"lsstorybucket"] ||
-            [lower containsString:@"storiesviewer"] ||
-            [lower containsString:@"storyviewer"]);
+            [lower containsString:@"storiesviewer"]);
 }
 
 static BOOL FFBCheckStoryViewerInControllerTree(UIViewController *vc, NSUInteger depth) {
     if (!vc || depth > 14) return NO;
     if (vc.isViewLoaded && !vc.view.hidden && vc.view.alpha > 0.01 && vc.view.window != nil) {
-        if (FFBViewOrControllerLooksLikeStoryViewer(NSStringFromClass(vc.class))) {
+        if (FFBControllerNameLooksLikeStoryViewer(NSStringFromClass(vc.class))) {
             return YES;
         }
     }
@@ -113,7 +160,7 @@ static BOOL FFBHasActiveDraggingScrollView(UIView *root, NSUInteger depth) {
     return NO;
 }
 
-static void FFBRewindEndedStoryPlayersInView(UIView *view, NSUInteger depth) {
+static void FFBRewindNearEndStoryPlayersInView(UIView *view, NSUInteger depth, BOOL forceIfStopped) {
     if (!view || depth > 12 || view.hidden || view.alpha <= 0.01) return;
     @try {
         AVPlayer *player = nil;
@@ -121,13 +168,13 @@ static void FFBRewindEndedStoryPlayersInView(UIView *view, NSUInteger depth) {
             player = ((AVPlayerLayer *)view.layer).player;
         }
         if (player && player.currentItem) {
+            player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
             CMTime dur = player.currentItem.duration;
             CMTime cur = player.currentItem.currentTime;
             if (CMTIME_IS_NUMERIC(dur) && CMTIME_IS_NUMERIC(cur)) {
                 Float64 durSec = CMTimeGetSeconds(dur);
                 Float64 curSec = CMTimeGetSeconds(cur);
-                if (durSec > 0.4 && (curSec >= durSec - 0.35 || player.rate == 0.0f)) {
-                    player.actionAtItemEnd = AVPlayerActionAtItemEndNone;
+                if (durSec > 0.45 && (curSec >= durSec - 0.28 || (forceIfStopped && player.rate == 0.0f && curSec >= durSec - 0.6))) {
                     [player seekToTime:kCMTimeZero toleranceBefore:kCMTimeZero toleranceAfter:kCMTimeZero];
                     [player play];
                 }
@@ -136,12 +183,33 @@ static void FFBRewindEndedStoryPlayersInView(UIView *view, NSUInteger depth) {
     } @catch (__unused NSException *e) {
     }
     for (UIView *sub in view.subviews) {
-        FFBRewindEndedStoryPlayersInView(sub, depth + 1);
+        FFBRewindNearEndStoryPlayersInView(sub, depth + 1, forceIfStopped);
     }
 }
 
+static void FFBStartStoryLoopWatchdogIfNeeded(void) {
+    if (!NSThread.isMainThread || gActiveStoryLoopTimer != nil) return;
+    gActiveStoryLoopTimer = [NSTimer scheduledTimerWithTimeInterval:0.15
+                                                            repeats:YES
+                                                              block:^(NSTimer *timer) {
+        if (!FocusFBIsStoryViewerVisibleNow()) {
+            [timer invalidate];
+            if (gActiveStoryLoopTimer == timer) {
+                gActiveStoryLoopTimer = nil;
+            }
+            return;
+        }
+        FocusFBPrefs *prefs = [FocusFBPrefs shared];
+        if (!prefs.enabled || !prefs.storiesDisableAutoAdvance) return;
+        UIWindow *win = FocusFBActiveWindow();
+        if (win) {
+            FFBRewindNearEndStoryPlayersInView(win, 0, NO);
+        }
+    }];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Filtro Rete / GraphQL per Mutazioni "Storia Visualizzata" (Seen State)
+// 3. Filtro Rete / GraphQL per Mutazioni "Storia Visualizzata" (Seen State)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static BOOL FFBStringMatchesStorySeenMutation(NSString *text) {
@@ -158,52 +226,48 @@ static BOOL FFBStringMatchesStorySeenMutation(NSString *text) {
 }
 
 BOOL FocusFBIsStorySeenNetworkRequest(NSURLRequest *request) {
-    if (!request) return NO;
+    if (!request || !gStoriesReadyAfterActive) return NO;
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
     if (!prefs.enabled || !prefs.storiesIncognitoMode) return NO;
 
-    // 1. Controllo istantaneo sull'header X-FB-Friendly-Name
-    NSString *friendlyHdr = [request valueForHTTPHeaderField:@"X-FB-Friendly-Name"];
-    if (friendlyHdr.length > 0) {
-        return FFBStringMatchesStorySeenMutation(friendlyHdr);
-    }
-
-    // 2. Controllo leggero sul body solo per richieste POST GraphQL di piccole dimensioni
-    NSURL *url = request.URL;
-    NSString *path = url.path.lowercaseString ?: @"";
-    if (![path containsString:@"graphql"]) return NO;
-
-    NSData *body = request.HTTPBody;
-    if (!body || body.length < 16 || body.length > 49152) return NO;
-
-    NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
-    if (!raw) return NO;
-    if (FFBStringMatchesStorySeenMutation(raw)) return YES;
-
-    if ([raw containsString:@"%"]) {
-        NSString *decoded = [raw stringByReplacingOccurrencesOfString:@"+" withString:@" "].stringByRemovingPercentEncoding;
-        if (decoded && FFBStringMatchesStorySeenMutation(decoded)) {
-            return YES;
+    @try {
+        // 1. Controllo istantaneo sull'header X-FB-Friendly-Name
+        NSString *friendlyHdr = [request valueForHTTPHeaderField:@"X-FB-Friendly-Name"];
+        if (friendlyHdr.length > 0) {
+            return FFBStringMatchesStorySeenMutation(friendlyHdr);
         }
+
+        // 2. Controllo leggero sul body solo per richieste POST GraphQL di piccole dimensioni
+        NSURL *url = request.URL;
+        NSString *path = url.path.lowercaseString ?: @"";
+        if (![path containsString:@"graphql"]) return NO;
+
+        NSData *body = request.HTTPBody;
+        if (!body || body.length < 16 || body.length > 49152) return NO;
+
+        NSString *raw = [[NSString alloc] initWithData:body encoding:NSUTF8StringEncoding];
+        if (!raw) return NO;
+        if (FFBStringMatchesStorySeenMutation(raw)) return YES;
+
+        if ([raw containsString:@"%"]) {
+            NSString *decoded = [raw stringByReplacingOccurrencesOfString:@"+" withString:@" "].stringByRemovingPercentEncoding;
+            if (decoded && FFBStringMatchesStorySeenMutation(decoded)) {
+                return YES;
+            }
+        }
+    } @catch (__unused NSException *e) {
     }
     return NO;
 }
 
-static NSURLRequest *FFBMockEmptyGraphQLSuccessRequest(void) {
-    // data: URL gestito interamente in memoria da NSURLSession (zero traffico di rete,
-    // task reale valido, risposta JSON {"data":{},"extensions":{"is_final":true}}).
-    static NSURLRequest *mockReq = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSURL *u = [NSURL URLWithString:@"data:application/json,%7B%22data%22%3A%7B%7D%2C%22extensions%22%3A%7B%22is_final%22%3Atrue%7D%7D"];
-        mockReq = [NSURLRequest requestWithURL:u];
-    });
-    return mockReq;
-}
-
 static NSURLSessionDataTask *FFBHook_NSURLSession_dataTaskWithRequest(id self, SEL _cmd, NSURLRequest *request) {
     if (FocusFBIsStorySeenNetworkRequest(request)) {
-        request = FFBMockEmptyGraphQLSuccessRequest();
+        NSURLSession *origSession = [self isKindOfClass:NSURLSession.class] ? (NSURLSession *)self : nil;
+        if (origSession && origSession.delegate != nil) {
+            return [FFBIsolatedStoryMockSession() dataTaskWithRequest:FFBIsolatedStoryMockRequest()
+                                                    completionHandler:^(__unused NSData *d, __unused NSURLResponse *r, __unused NSError *e) {}];
+        }
+        return [FFBIsolatedStoryMockSession() dataTaskWithRequest:FFBIsolatedStoryMockRequest()];
     }
     return gOrigDataTaskReq ? gOrigDataTaskReq(self, _cmd, request) : nil;
 }
@@ -214,102 +278,61 @@ static NSURLSessionDataTask *FFBHook_NSURLSession_dataTaskWithRequestCompletion(
     NSURLRequest *request,
     void (^completionHandler)(NSData *, NSURLResponse *, NSError *)) {
     if (FocusFBIsStorySeenNetworkRequest(request)) {
-        request = FFBMockEmptyGraphQLSuccessRequest();
+        return [FFBIsolatedStoryMockSession() dataTaskWithRequest:FFBIsolatedStoryMockRequest()
+                                                completionHandler:completionHandler];
     }
     return gOrigDataTaskReqComp ? gOrigDataTaskReqComp(self, _cmd, request, completionHandler) : nil;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Hook Runtime Objective-C su FBSnacks* / FBStories* / LSStory* (ABI-Safe)
+// 4. Hook Pigri (Lazy) e 100% ABI-Exact con imp_implementationWithBlock solo su FBSnacks*
 // ─────────────────────────────────────────────────────────────────────────────
 
-static IMP FFBLookupOrigStoryIMP(id obj, SEL sel) {
-    Class cur = object_getClass(obj);
-    os_unfair_lock_lock(&gStoryHookLock);
-    IMP found = NULL;
-    while (cur != Nil) {
-        auto it = gOrigStoryIMPs.find(FFBClassSelKey{cur, sel});
-        if (it != gOrigStoryIMPs.end()) {
-            found = it->second;
-            break;
-        }
-        cur = class_getSuperclass(cur);
-    }
-    os_unfair_lock_unlock(&gStoryHookLock);
-    return found;
-}
+enum FFBStoryHookKind : int {
+    FFBStoryHookKindBlockSeen = 1,
+    FFBStoryHookKindBlockAutoAdvance = 2,
+    FFBStoryHookKindTouchGatedTransition = 3,
+};
 
-static BOOL FFBIsABISafeVoidMethod(Method m) {
-    if (!m) return NO;
-    const char *enc = method_getTypeEncoding(m);
-    if (!enc || enc[0] != 'v') return NO;
-    // Escludi qualsiasi metodo con argomenti struct, array, union o long double
-    for (const char *p = enc; *p != '\0'; ++p) {
-        if (*p == '{' || *p == '[' || *p == '(' || *p == 'D') {
-            return NO;
-        }
-    }
+// Restituisce il numero di argomenti oggetto puri (0..3 oltre a self e _cmd), oppure -1 se la firma non è v@:[@...]
+static int FFBExactPureObjectArgCount(Method m) {
+    if (!m) return -1;
+    char retType[16] = {0};
+    method_getReturnType(m, retType, sizeof(retType));
+    if (retType[0] != 'v' || retType[1] != '\0') return -1;
+
     unsigned int nargs = method_getNumberOfArguments(m);
-    return (nargs >= 2 && nargs <= 7);
-}
+    if (nargs < 2 || nargs > 5) return -1;
 
-static void FFBInstallStoryVoidHook(Class cls, Method m, IMP hookIMP) {
-    if (!cls || !m || !hookIMP || !FFBIsABISafeVoidMethod(m)) return;
-    SEL sel = method_getName(m);
-    IMP orig = method_getImplementation(m);
-    const char *types = method_getTypeEncoding(m);
-    if (!orig || !types || orig == hookIMP) return;
-
-    os_unfair_lock_lock(&gStoryHookLock);
-    FFBClassSelKey key{cls, sel};
-    if (gOrigStoryIMPs.find(key) != gOrigStoryIMPs.end()) {
-        os_unfair_lock_unlock(&gStoryHookLock);
-        return;
+    for (unsigned int i = 2; i < nargs; i++) {
+        char argType[16] = {0};
+        method_getArgumentType(m, i, argType, sizeof(argType));
+        // Accetta esclusivamente argomenti oggetto standard ('@'), mai struct, blocchi speciali o scalari
+        if (argType[0] != '@' || argType[1] != '\0') {
+            return -1;
+        }
     }
-    gOrigStoryIMPs[key] = orig;
-    os_unfair_lock_unlock(&gStoryHookLock);
-
-    class_replaceMethod(cls, sel, hookIMP, types);
+    return (int)(nargs - 2);
 }
 
-// Trampoline A: blocca l'invio dello stato "visto" delle Storie quando storiesIncognitoMode è attivo
-static void FFBTrampoline_BlockStorySeen(id self, SEL _cmd,
-                                         uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
-                                         double d0, double d1, double d2, double d3) {
+static BOOL FFBShouldBlockStoryCallNow(FFBStoryHookKind kind) {
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (prefs.enabled && prefs.storiesIncognitoMode) {
-        return;
-    }
-    FFBStoryTrampolineIMP orig = (FFBStoryTrampolineIMP)FFBLookupOrigStoryIMP(self, _cmd);
-    if (orig) {
-        orig(self, _cmd, a2, a3, a4, a5, a6, d0, d1, d2, d3);
-    }
-}
+    if (!prefs.enabled) return NO;
 
-// Trampoline B: blocca il completamento automatico del timer / fine video nelle Storie
-static void FFBTrampoline_BlockAutoAdvanceExplicit(id self, SEL _cmd,
-                                                   uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
-                                                   double d0, double d1, double d2, double d3) {
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (prefs.enabled && prefs.storiesDisableAutoAdvance) {
+    if (kind == FFBStoryHookKindBlockSeen) {
+        return prefs.storiesIncognitoMode;
+    }
+    if (!prefs.storiesDisableAutoAdvance) {
+        return NO;
+    }
+    if (kind == FFBStoryHookKindBlockAutoAdvance) {
         if (NSThread.isMainThread) {
             UIWindow *win = FocusFBActiveWindow();
-            if (win) FFBRewindEndedStoryPlayersInView(win, 0);
+            if (win) FFBRewindNearEndStoryPlayersInView(win, 0, YES);
         }
-        return;
+        return YES;
     }
-    FFBStoryTrampolineIMP orig = (FFBStoryTrampolineIMP)FFBLookupOrigStoryIMP(self, _cmd);
-    if (orig) {
-        orig(self, _cmd, a2, a3, a4, a5, a6, d0, d1, d2, d3);
-    }
-}
-
-// Trampoline C: consente cambio persona/storia SOLO se l'utente ha appena toccato o trascinato lo schermo
-static void FFBTrampoline_TouchGatedNextStory(id self, SEL _cmd,
-                                              uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6,
-                                              double d0, double d1, double d2, double d3) {
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (prefs.enabled && prefs.storiesDisableAutoAdvance) {
+    if (kind == FFBStoryHookKindTouchGatedTransition) {
         double sinceTouch = CFAbsoluteTimeGetCurrent() - FocusFBLastUserTouchTimestamp();
         BOOL userScrolling = NO;
         if (NSThread.isMainThread) {
@@ -319,101 +342,139 @@ static void FFBTrampoline_TouchGatedNextStory(id self, SEL _cmd,
         if (sinceTouch > 0.55 && !userScrolling) {
             if (NSThread.isMainThread) {
                 UIWindow *win = FocusFBActiveWindow();
-                if (win) FFBRewindEndedStoryPlayersInView(win, 0);
+                if (win) FFBRewindNearEndStoryPlayersInView(win, 0, YES);
             }
-            return;
+            return YES;
         }
     }
-    FFBStoryTrampolineIMP orig = (FFBStoryTrampolineIMP)FFBLookupOrigStoryIMP(self, _cmd);
-    if (orig) {
-        orig(self, _cmd, a2, a3, a4, a5, a6, d0, d1, d2, d3);
+    return NO;
+}
+
+static void FFBInstallBlockHookOnSnacksMethod(Class cls, Method m, FFBStoryHookKind kind) {
+    int objArgs = FFBExactPureObjectArgCount(m);
+    if (objArgs < 0) return;
+
+    SEL sel = method_getName(m);
+    IMP origIMP = method_getImplementation(m);
+    const char *types = method_getTypeEncoding(m);
+    if (!sel || !origIMP || !types) return;
+
+    std::string key = std::string(class_getName(cls)) + "::" + std::string(sel_getName(sel));
+    os_unfair_lock_lock(&gStoryHookLock);
+    bool inserted = gHookedClassSelPairs.insert(key).second;
+    os_unfair_lock_unlock(&gStoryHookLock);
+    if (!inserted) return;
+
+    IMP newIMP = NULL;
+    if (objArgs == 0) {
+        typedef void (*Orig0)(id, SEL);
+        Orig0 origFn = (Orig0)origIMP;
+        newIMP = imp_implementationWithBlock(^(id selfObj) {
+            if (FFBShouldBlockStoryCallNow(kind)) return;
+            origFn(selfObj, sel);
+        });
+    } else if (objArgs == 1) {
+        typedef void (*Orig1)(id, SEL, id);
+        Orig1 origFn = (Orig1)origIMP;
+        newIMP = imp_implementationWithBlock(^(id selfObj, id a1) {
+            if (FFBShouldBlockStoryCallNow(kind)) return;
+            origFn(selfObj, sel, a1);
+        });
+    } else if (objArgs == 2) {
+        typedef void (*Orig2)(id, SEL, id, id);
+        Orig2 origFn = (Orig2)origIMP;
+        newIMP = imp_implementationWithBlock(^(id selfObj, id a1, id a2) {
+            if (FFBShouldBlockStoryCallNow(kind)) return;
+            origFn(selfObj, sel, a1, a2);
+        });
+    } else if (objArgs == 3) {
+        typedef void (*Orig3)(id, SEL, id, id, id);
+        Orig3 origFn = (Orig3)origIMP;
+        newIMP = imp_implementationWithBlock(^(id selfObj, id a1, id a2, id a3) {
+            if (FFBShouldBlockStoryCallNow(kind)) return;
+            origFn(selfObj, sel, a1, a2, a3);
+        });
+    }
+
+    if (newIMP) {
+        class_replaceMethod(cls, sel, newIMP, types);
     }
 }
 
-static void FFBInspectAndHookStoryClass(Class cls, const char *rawClsName) {
-    if (!cls || !rawClsName) return;
-    NSString *clsName = [NSString stringWithUTF8String:rawClsName];
-    NSString *lowerCls = clsName.lowercaseString;
+static void FFBHookExactSnacksClassIfNeeded(Class cls) {
+    if (!cls) return;
+    const char *rawName = class_getName(cls);
+    if (!rawName) return;
 
-    BOOL isSnacksOrStory = ([lowerCls hasPrefix:@"fbsnacks"] ||
-                            [lowerCls hasPrefix:@"fbstories"] ||
-                            [lowerCls hasPrefix:@"fbstory"] ||
-                            [lowerCls hasPrefix:@"lsstory"]);
-    if (!isSnacksOrStory) return;
+    // Sicurezza assoluta: opera SOLO su classi FBSnacks* (Storie 24h), mai su FBStory* (Feed) o Swift _TtC*
+    if (strncmp(rawName, "FBSnacks", 8) != 0) return;
 
-    BOOL isSeenManagerClass = ([lowerCls containsString:@"seenstate"] ||
-                               [lowerCls containsString:@"seenmanager"] ||
-                               [lowerCls hasSuffix:@"seen"]);
+    std::string clsKey(rawName);
+    os_unfair_lock_lock(&gStoryHookLock);
+    bool alreadyDone = !gHookedSnacksClasses.insert(clsKey).second;
+    os_unfair_lock_unlock(&gStoryHookLock);
+    if (alreadyDone) return;
 
-    unsigned int methodCount = 0;
-    Method *methods = class_copyMethodList(cls, &methodCount);
+    NSString *lowerCls = [NSString stringWithUTF8String:rawName].lowercaseString;
+    BOOL isSeenStateClass = ([lowerCls containsString:@"seenstate"] ||
+                             [lowerCls containsString:@"seenmanager"]);
+
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
     if (!methods) return;
 
-    for (unsigned int i = 0; i < methodCount; i++) {
+    for (unsigned int i = 0; i < count; i++) {
         Method m = methods[i];
-        if (!FFBIsABISafeVoidMethod(m)) continue;
+        if (FFBExactPureObjectArgCount(m) < 0) continue;
 
-        SEL sel = method_getName(m);
-        NSString *selStr = NSStringFromSelector(sel);
-        NSString *lowerSel = selStr.lowercaseString;
-
-        // Escludi getter / viewer sheet (così puoi sempre vedere chi ha visualizzato la TUA storia)
-        if ([lowerSel containsString:@"viewersheet"] ||
-            [lowerSel containsString:@"viewerlist"] ||
-            [lowerSel hasPrefix:@"get"] ||
-            [lowerSel hasPrefix:@"is"] ||
-            [lowerSel hasPrefix:@"has"]) {
+        NSString *lowerSel = NSStringFromSelector(method_getName(m)).lowercaseString;
+        if ([lowerSel hasPrefix:@"init"] ||
+            [lowerSel hasPrefix:@"dealloc"] ||
+            [lowerSel hasPrefix:@".cxx"] ||
+            [lowerSel containsString:@"viewersheet"] ||
+            [lowerSel containsString:@"viewerlist"]) {
             continue;
         }
 
-        // 1. Hook Incognito (Seen State)
-        if (isSeenManagerClass) {
-            if ([lowerSel containsString:@"send"] ||
-                [lowerSel containsString:@"mark"] ||
-                [lowerSel containsString:@"report"] ||
-                [lowerSel containsString:@"record"] ||
-                [lowerSel containsString:@"update"] ||
-                [lowerSel containsString:@"flush"] ||
-                [lowerSel containsString:@"sync"] ||
-                [lowerSel containsString:@"didsee"] ||
-                [lowerSel containsString:@"didview"]) {
-                FFBInstallStoryVoidHook(cls, m, (IMP)FFBTrampoline_BlockStorySeen);
+        if (isSeenStateClass) {
+            if ([lowerSel containsString:@"sendseen"] ||
+                [lowerSel containsString:@"_sendseen"] ||
+                [lowerSel containsString:@"markstory"] ||
+                [lowerSel containsString:@"markbucket"] ||
+                [lowerSel containsString:@"markthread"] ||
+                [lowerSel containsString:@"updateseen"] ||
+                [lowerSel containsString:@"reportseen"] ||
+                [lowerSel containsString:@"flushseen"]) {
+                FFBInstallBlockHookOnSnacksMethod(cls, m, FFBStoryHookKindBlockSeen);
                 continue;
             }
-        } else if ([lowerSel containsString:@"seen"] &&
-                   ([lowerSel containsString:@"sendseen"] ||
-                    [lowerSel containsString:@"_sendseen"] ||
-                    [lowerSel containsString:@"markstoryseen"] ||
-                    [lowerSel containsString:@"markstoryasseen"] ||
-                    [lowerSel containsString:@"markbucketseen"] ||
-                    [lowerSel containsString:@"markthreadseen"] ||
-                    [lowerSel containsString:@"reportseen"] ||
-                    [lowerSel containsString:@"updateseenstate"])) {
-            FFBInstallStoryVoidHook(cls, m, (IMP)FFBTrampoline_BlockStorySeen);
+        } else if ([lowerSel containsString:@"_sendseenthreadids"] ||
+                   [lowerSel containsString:@"sendseenthreadids"] ||
+                   [lowerSel containsString:@"markstoryseen"] ||
+                   [lowerSel containsString:@"markstoryasseen"] ||
+                   [lowerSel containsString:@"updateseenstate"]) {
+            FFBInstallBlockHookOnSnacksMethod(cls, m, FFBStoryHookKindBlockSeen);
             continue;
         }
 
-        // 2. Hook Blocco Avanzamento Automatico (Timer / Fine Riproduzione)
         if ([lowerSel containsString:@"autoadvance"] ||
             [lowerSel containsString:@"timerdidfinish"] ||
             [lowerSel containsString:@"timerdidexpire"] ||
-            [lowerSel containsString:@"storytimerdid"] ||
             [lowerSel containsString:@"progressviewdidfinish"] ||
             [lowerSel containsString:@"progressbardidfinish"] ||
             [lowerSel containsString:@"mediaviewdidfinishplaying"] ||
             [lowerSel containsString:@"videoplaybackcontrollerdidfinish"]) {
-            FFBInstallStoryVoidHook(cls, m, (IMP)FFBTrampoline_BlockAutoAdvanceExplicit);
+            FFBInstallBlockHookOnSnacksMethod(cls, m, FFBStoryHookKindBlockAutoAdvance);
             continue;
         }
 
-        // 3. Hook Transizione Bucket / Persona successiva (consentita solo su tocco/swipe reale)
         if ([lowerSel containsString:@"advancetonext"] ||
             [lowerSel containsString:@"movetonextbucket"] ||
             [lowerSel containsString:@"transitiontonextbucket"] ||
             [lowerSel containsString:@"gotonextbucket"] ||
             [lowerSel containsString:@"shownextbucket"] ||
             [lowerSel containsString:@"_gotonextthread"]) {
-            FFBInstallStoryVoidHook(cls, m, (IMP)FFBTrampoline_TouchGatedNextStory);
+            FFBInstallBlockHookOnSnacksMethod(cls, m, FFBStoryHookKindTouchGatedTransition);
             continue;
         }
     }
@@ -421,52 +482,50 @@ static void FFBInspectAndHookStoryClass(Class cls, const char *rawClsName) {
     free(methods);
 }
 
-static BOOL FFBShouldScanImagePathForStories(const char *imagePath) {
-    if (!imagePath) return NO;
-    if (strstr(imagePath, "/System/Library/") != NULL ||
-        strstr(imagePath, "/usr/lib/") != NULL ||
-        strstr(imagePath, "FocusFB.dylib") != NULL ||
-        strstr(imagePath, "LiveContainer") != NULL) {
-        return NO;
+static void FFBLazyHookKnownSnacksClasses(UIViewController *candidateVC) {
+    static NSArray<NSString *> *knownNames = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        knownNames = @[
+            @"FBSnacksBucketsSeenStateManager",
+            @"FBSnacksSeenStateManager",
+            @"FBSnacksTimerController",
+            @"FBSnacksViewerViewController",
+            @"FBSnacksBucketViewController",
+            @"FBSnacksStackViewController",
+            @"FBSnacksMediaContainerView"
+        ];
+    });
+
+    for (NSString *name in knownNames) {
+        Class c = NSClassFromString(name);
+        if (c) FFBHookExactSnacksClassIfNeeded(c);
     }
-    return (strstr(imagePath, ".app/") != NULL);
-}
 
-static void FFBScanLoadedFacebookImagesForStoryClasses(void) {
-    uint32_t imgCount = _dyld_image_count();
-    for (uint32_t i = 0; i < imgCount; i++) {
-        const char *imgPath = _dyld_get_image_name(i);
-        if (!FFBShouldScanImagePathForStories(imgPath)) continue;
-
-        os_unfair_lock_lock(&gStoryHookLock);
-        bool alreadyScanned = !gScannedImagePaths.insert(std::string(imgPath)).second;
-        os_unfair_lock_unlock(&gStoryHookLock);
-        if (alreadyScanned) continue;
-
-        unsigned int clsCount = 0;
-        const char **clsNames = objc_copyClassNamesForImage(imgPath, &clsCount);
-        if (!clsNames) continue;
-
-        for (unsigned int c = 0; c < clsCount; c++) {
-            const char *name = clsNames[c];
-            if (!name) continue;
-            // Prefiltro C ultra-rapido: ispeziona solo classi che iniziano per FB o LS
-            if (!((name[0] == 'F' && name[1] == 'B') || (name[0] == 'L' && name[1] == 'S'))) {
-                continue;
-            }
-            if (strstr(name, "Snacks") == NULL &&
-                strstr(name, "Stor") == NULL &&
-                strstr(name, "stor") == NULL) {
-                continue;
-            }
-            Class cls = objc_lookUpClass(name);
-            if (cls) {
-                FFBInspectAndHookStoryClass(cls, name);
-            }
+    if (candidateVC) {
+        Class vcCls = candidateVC.class;
+        while (vcCls && vcCls != UIViewController.class && vcCls != NSObject.class) {
+            FFBHookExactSnacksClassIfNeeded(vcCls);
+            vcCls = class_getSuperclass(vcCls);
         }
-        free(clsNames);
+        for (UIViewController *child in candidateVC.childViewControllers) {
+            FFBHookExactSnacksClassIfNeeded(child.class);
+        }
     }
 }
+
+void FocusFBNotifyStoryCandidateController(UIViewController *vc) {
+    if (!vc || !gStoriesReadyAfterActive) return;
+    NSString *clsName = NSStringFromClass(vc.class);
+    if (!FFBControllerNameLooksLikeStoryViewer(clsName)) return;
+
+    FFBLazyHookKnownSnacksClasses(vc);
+    FFBStartStoryLoopWatchdogIfNeeded();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. Installazione Post-Avvio Sicura
+// ─────────────────────────────────────────────────────────────────────────────
 
 static void FFBHook_UIApplication_sendEvent(id self, SEL _cmd, UIEvent *event) {
     if (event && event.type == UIEventTypeTouches) {
@@ -491,17 +550,9 @@ static BOOL FFBReplaceMethodSimple(Class cls, SEL sel, IMP newIMP, IMP *origOut)
     return YES;
 }
 
-static void FFBStoriesDyldImageAdded(const struct mach_header *mh, __unused intptr_t slide) {
-    (void)mh;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        FFBScanLoadedFacebookImagesForStoryClasses();
-    });
-}
-
-void FocusFBInstallStoriesManager(void) {
+static void FFBActivateStoriesHooksAfterBecomeActive(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        // 1. Tracciamento leggero dei tocchi per distinguere tap/swipe reali dal timer automatico
         if (!gInstalledSendEventHook) {
             gInstalledSendEventHook = FFBReplaceMethodSimple(UIApplication.class,
                                                              @selector(sendEvent:),
@@ -509,7 +560,6 @@ void FocusFBInstallStoriesManager(void) {
                                                              (IMP *)&gOrigAppSendEvent);
         }
 
-        // 2. Intercettazione richieste HTTP/GraphQL di conferma visualizzazione Storie su NSURLSession
         if (!gInstalledURLSessionHooks) {
             BOOL ok1 = FFBReplaceMethodSimple(NSURLSession.class,
                                               @selector(dataTaskWithRequest:),
@@ -522,7 +572,6 @@ void FocusFBInstallStoriesManager(void) {
             gInstalledURLSessionHooks = (ok1 || ok2);
         }
 
-        // 3. Loop automatico quando un video dentro le Storie arriva alla fine (evita freeze o salto)
         [[NSNotificationCenter defaultCenter] addObserverForName:AVPlayerItemDidPlayToEndTimeNotification
                                                           object:nil
                                                            queue:[NSOperationQueue mainQueue]
@@ -537,12 +586,28 @@ void FocusFBInstallStoriesManager(void) {
             }
             UIWindow *win = FocusFBActiveWindow();
             if (win) {
-                FFBRewindEndedStoryPlayersInView(win, 0);
+                FFBRewindNearEndStoryPlayersInView(win, 0, YES);
             }
         }];
 
-        // 4. Scansione classi FBSnacks / FBStories / LSStory immediata + per framework caricati pigramente
-        FFBScanLoadedFacebookImagesForStoryClasses();
-        _dyld_register_func_for_add_image(FFBStoriesDyldImageAdded);
+        gStoriesReadyAfterActive = YES;
+    });
+}
+
+void FocusFBInstallStoriesManager(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            FFBActivateStoriesHooksAfterBecomeActive();
+        }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+                FFBActivateStoriesHooksAfterBecomeActive();
+            }
+        });
     });
 }

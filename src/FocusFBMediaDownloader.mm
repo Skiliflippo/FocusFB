@@ -14,14 +14,9 @@
 static const NSInteger kFFBQuickDownloadBtnTag = 0x70C5D1;
 static char kWindowMediaLongPressKey;
 
-typedef id (*FFBAVURLAssetInitIMP)(id, SEL, NSURL *, NSDictionary *);
-static FFBAVURLAssetInitIMP gOrigAVURLAssetInit = NULL;
-static BOOL gInstalledAVAssetHook = NO;
-
-static os_unfair_lock gAssetMapLock = OS_UNFAIR_LOCK_INIT;
-static NSMapTable<AVAsset *, NSURL *> *gAssetURLTable = nil;
 static NSTimer *gQuickBtnVisibilityTimer = nil;
 static BOOL gDownloadInFlight = NO;
+static BOOL gMediaDownloaderReady = NO;
 
 // Selettori opzionali delle classi media interne di Facebook (FBVideoPlayback*, FBSnacks*, FBWebImage*)
 @interface NSObject (FFBFacebookMediaSelectors)
@@ -59,32 +54,22 @@ static BOOL gDownloadInFlight = NO;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 2. Tracciamento Sicuro AVURLAsset -> NSURL
+// 2. Risoluzione Sicura AVURLAsset -> NSURL (senza hook su init cluster)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static NSURL *FFBLookupURLForAsset(AVAsset *asset) {
     if (!asset) return nil;
     if ([asset isKindOfClass:AVURLAsset.class]) {
-        NSURL *u = ((AVURLAsset *)asset).URL;
-        if (u) return u;
+        return ((AVURLAsset *)asset).URL;
     }
-    os_unfair_lock_lock(&gAssetMapLock);
-    NSURL *mapped = gAssetURLTable ? [gAssetURLTable objectForKey:asset] : nil;
-    os_unfair_lock_unlock(&gAssetMapLock);
-    return mapped;
-}
-
-static id FFBHook_AVURLAsset_initWithURL(id self, SEL _cmd, NSURL *URL, NSDictionary *options) {
-    id obj = gOrigAVURLAssetInit ? gOrigAVURLAssetInit(self, _cmd, URL, options) : nil;
-    if (obj && URL) {
-        os_unfair_lock_lock(&gAssetMapLock);
-        if (!gAssetURLTable) {
-            gAssetURLTable = [NSMapTable weakToStrongObjectsMapTable];
+    if ([asset respondsToSelector:@selector(URL)]) {
+        @try {
+            id u = [asset valueForKey:@"URL"];
+            if ([u isKindOfClass:NSURL.class]) return (NSURL *)u;
+        } @catch (__unused NSException *e) {
         }
-        [gAssetURLTable setObject:URL forKey:(AVAsset *)obj];
-        os_unfair_lock_unlock(&gAssetMapLock);
     }
-    return obj;
+    return nil;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -757,7 +742,7 @@ static void FFBSaveLocalVideoFileToCameraRoll(NSURL *localVideoURL, BOOL shareIn
         FocusFBShowToast(FFBLoc(@"DL.Failed"), @"exclamationmark.triangle.fill");
         return;
     }
-    if (shareInstead) {
+    if (shareInstead || !NSClassFromString(@"PHPhotoLibrary") || !NSClassFromString(@"PHAssetChangeRequest")) {
         FFBPresentShareSheetForItem(localVideoURL);
         return;
     }
@@ -819,7 +804,7 @@ static void FFBSaveImageToCameraRoll(UIImage * _Nullable image, NSURL * _Nullabl
             return;
         }
 
-        if (shareInstead) {
+        if (shareInstead || !NSClassFromString(@"PHPhotoLibrary") || !NSClassFromString(@"PHAssetChangeRequest")) {
             FFBPresentShareSheetForItem(finalImg);
             return;
         }
@@ -1097,6 +1082,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 // ─────────────────────────────────────────────────────────────────────────────
 
 void FocusFBMediaDownloaderSyncUI(void) {
+    if (!gMediaDownloaderReady) return;
     if (!NSThread.isMainThread) {
         dispatch_async(dispatch_get_main_queue(), ^{
             FocusFBMediaDownloaderSyncUI();
@@ -1189,22 +1175,23 @@ void FocusFBMediaDownloaderSyncUI(void) {
 void FocusFBInstallMediaDownloader(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        if (!gInstalledAVAssetHook) {
-            Method m = class_getInstanceMethod(AVURLAsset.class, @selector(initWithURL:options:));
-            if (m) {
-                IMP orig = method_getImplementation(m);
-                const char *types = method_getTypeEncoding(m);
-                if (orig && types && orig != (IMP)FFBHook_AVURLAsset_initWithURL) {
-                    gOrigAVURLAssetInit = (FFBAVURLAssetInitIMP)orig;
-                    if (!class_addMethod(AVURLAsset.class, @selector(initWithURL:options:), (IMP)FFBHook_AVURLAsset_initWithURL, types)) {
-                        method_setImplementation(m, (IMP)FFBHook_AVURLAsset_initWithURL);
-                    }
-                    gInstalledAVAssetHook = YES;
-                }
-            }
-        }
-
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+
+        [nc addObserverForName:UIApplicationDidBecomeActiveNotification
+                        object:nil
+                         queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification *note) {
+            gMediaDownloaderReady = YES;
+            FocusFBMediaDownloaderSyncUI();
+        }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+                gMediaDownloaderReady = YES;
+                FocusFBMediaDownloaderSyncUI();
+            }
+        });
+
         [nc addObserverForName:FocusFBPreferencesDidChangeNotification
                         object:nil
                          queue:[NSOperationQueue mainQueue]

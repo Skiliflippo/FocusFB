@@ -5,7 +5,6 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#include <mach-o/dyld.h>
 #include <algorithm>
 #include <atomic>
 
@@ -28,16 +27,19 @@
 @end
 
 static std::atomic<uint64_t> gBlockedAdsCount{0};
+static std::atomic<bool> gAdBlockerReady{false};
 static thread_local bool gInsideInternalJSONPass = false;
 
-typedef id (*FFBPandoInitIMP)(id, SEL, void *);
+// IMPORTANTE: per i selettori della famiglia -init* usiamo void* grezzi così Clang ARC
+// rispetta esattamente la convenzione ns_consumed (self +1) -> ns_returns_retained (+1)!
+typedef void *(*FFBPandoRawInitIMP)(void *, SEL, void *);
 typedef id (*FFBJSONDataIMP)(id, SEL, NSData *, NSJSONReadingOptions, NSError * __autoreleasing *);
 typedef id (*FFBRCTHandlerIMP)(id, SEL, NSURLRequest *);
 
-static FFBPandoInitIMP  gOrigInitWithPandoTree = NULL;
-static FFBPandoInitIMP  gOrigInitWithFBTree    = NULL;
-static FFBJSONDataIMP   gOrigJSONWithData      = NULL;
-static FFBRCTHandlerIMP gOrigRCTHandlerForReq  = NULL;
+static FFBPandoRawInitIMP gOrigInitWithPandoTree = NULL;
+static FFBPandoRawInitIMP gOrigInitWithFBTree    = NULL;
+static FFBJSONDataIMP      gOrigJSONWithData      = NULL;
+static FFBRCTHandlerIMP    gOrigRCTHandlerForReq  = NULL;
 
 static BOOL gInstalledPandoHook  = NO;
 static BOOL gInstalledFBTreeHook = NO;
@@ -677,6 +679,9 @@ static NSMutableSet *FFBLiveRCTDelegates(void) {
 @end
 
 static id FFBHook_RCTNetworking_handlerForRequest(id self, SEL _cmd, NSURLRequest *request) {
+    if (!gAdBlockerReady.load(std::memory_order_relaxed)) {
+        return gOrigRCTHandlerForReq ? gOrigRCTHandlerForReq(self, _cmd, request) : nil;
+    }
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
     if (prefs.enabled) {
         if (FocusFBIsStorySeenNetworkRequest(request)) {
@@ -772,6 +777,35 @@ static BOOL FFBIsMarketplaceModelSponsoredViaKVC(id model) {
     return NO;
 }
 
+static BOOL FFBClassIsFeedOrCommerceCandidate(NSString *clsName) {
+    if (clsName.length < 4) return NO;
+    // Non toccare mai oggetti di bootstrap/autenticazione/utente (es. FBMemViewer, FBMemUser, FBMemConfig*)
+    return ([clsName containsString:@"Edge"] ||
+            [clsName containsString:@"Story"] ||
+            [clsName containsString:@"Stories"] ||
+            [clsName containsString:@"Snacks"] ||
+            [clsName containsString:@"FeedUnit"] ||
+            [clsName containsString:@"Bucket"] ||
+            [clsName containsString:@"Marketplace"] ||
+            [clsName containsString:@"Commerce"] ||
+            [clsName containsString:@"Sponsored"] ||
+            [clsName containsString:@"AdBreak"] ||
+            [clsName containsString:@"InstreamVideoAd"] ||
+            [clsName containsString:@"BannerAd"] ||
+            [clsName containsString:@"AdsFeed"] ||
+            [clsName containsString:@"PYMK"] ||
+            [clsName containsString:@"PeopleYouMayKnow"] ||
+            [clsName containsString:@"FriendingPossibilities"] ||
+            [clsName containsString:@"FriendSuggestions"] ||
+            [clsName containsString:@"Shorts"] ||
+            [clsName containsString:@"Reels"] ||
+            [clsName containsString:@"Clips"] ||
+            [clsName containsString:@"GroupsYouShouldJoin"] ||
+            [clsName containsString:@"PagesYouMayLike"] ||
+            [clsName containsString:@"ThreadsInFeed"] ||
+            [clsName containsString:@"SingleBucketInlineViewer"]);
+}
+
 static BOOL FFBShouldFilterGraphQLModel(id model) {
     if (!model) return NO;
 
@@ -783,6 +817,9 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
 
     // Non filtrare il nodo figlio *SponsoredData* stesso, così il post padre mantiene [story sponsoredData] != nil
     if ([clsName containsString:@"SponsoredData"] || [clsName hasSuffix:@"AdData"]) {
+        return NO;
+    }
+    if (!FFBClassIsFeedOrCommerceCandidate(clsName)) {
         return NO;
     }
 
@@ -918,16 +955,38 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
     return NO;
 }
 
-static id FFBHook_initWithFBPandoTree(id self, SEL _cmd, void *tree) {
-    id model = gOrigInitWithPandoTree ? gOrigInitWithPandoTree(self, _cmd, tree) : nil;
-    if (!model) return nil;
-    return FFBShouldFilterGraphQLModel(model) ? nil : model;
+static void *FFBHook_initWithFBPandoTree(void *rawSelf, SEL _cmd, void *tree) {
+    void *rawModel = gOrigInitWithPandoTree ? gOrigInitWithPandoTree(rawSelf, _cmd, tree) : NULL;
+    if (!rawModel || !gAdBlockerReady.load(std::memory_order_relaxed)) {
+        return rawModel;
+    }
+    @try {
+        id model = (__bridge id)rawModel;
+        if (FFBShouldFilterGraphQLModel(model)) {
+            id consumed = (__bridge_transfer id)rawModel;
+            (void)consumed;
+            return NULL;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return rawModel;
 }
 
-static id FFBHook_initWithFBTree(id self, SEL _cmd, void *tree) {
-    id model = gOrigInitWithFBTree ? gOrigInitWithFBTree(self, _cmd, tree) : nil;
-    if (!model) return nil;
-    return FFBShouldFilterGraphQLModel(model) ? nil : model;
+static void *FFBHook_initWithFBTree(void *rawSelf, SEL _cmd, void *tree) {
+    void *rawModel = gOrigInitWithFBTree ? gOrigInitWithFBTree(rawSelf, _cmd, tree) : NULL;
+    if (!rawModel || !gAdBlockerReady.load(std::memory_order_relaxed)) {
+        return rawModel;
+    }
+    @try {
+        id model = (__bridge id)rawModel;
+        if (FFBShouldFilterGraphQLModel(model)) {
+            id consumed = (__bridge_transfer id)rawModel;
+            (void)consumed;
+            return NULL;
+        }
+    } @catch (__unused NSException *e) {
+    }
+    return rawModel;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1021,7 +1080,16 @@ static id FFBHook_JSONObjectWithData(id self,
                                      NSJSONReadingOptions opt,
                                      NSError * __autoreleasing *error) {
     id parsed = gOrigJSONWithData ? gOrigJSONWithData(self, _cmd, data, opt, error) : nil;
-    if (!parsed || !data || gInsideInternalJSONPass) return parsed;
+    if (!parsed || !data || gInsideInternalJSONPass || !gAdBlockerReady.load(std::memory_order_relaxed)) {
+        return parsed;
+    }
+
+    // Filtra esclusivamente payload radice GraphQL (mai MobileConfig o file di configurazione)
+    if (![parsed isKindOfClass:NSDictionary.class]) return parsed;
+    NSDictionary *rootDict = (NSDictionary *)parsed;
+    if (!rootDict[@"data"] && !rootDict[@"label"] && !rootDict[@"edges"]) {
+        return parsed;
+    }
 
     FFBFilterFlags flags = FFBReadCurrentFilterFlags();
     if (!flags.anyJSONActive()) return parsed;
@@ -1084,17 +1152,50 @@ static void FFBInstallAvailableAdHooksNow(void) {
     }
 }
 
-static void FFBAdBlockDyldImageAdded(__unused const struct mach_header *mh, __unused intptr_t vmaddr_slide) {
-    if (gInstalledRCTHook && gInstalledPandoHook && gInstalledFBTreeHook) return;
-    dispatch_async(dispatch_get_main_queue(), ^{
+void FocusFBRetryLazyAdHooksIfNeeded(void) {
+    if (!gAdBlockerReady.load(std::memory_order_relaxed)) return;
+    if (gInstalledRCTHook && gInstalledPandoHook && gInstalledFBTreeHook && gInstalledJSONHook) {
+        return;
+    }
+    if (NSThread.isMainThread) {
         FFBInstallAvailableAdHooksNow();
+    } else {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FFBInstallAvailableAdHooksNow();
+        });
+    }
+}
+
+static void FFBActivateAdBlockerAfterBecomeActive(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        FFBInstallAvailableAdHooksNow();
+        gAdBlockerReady.store(true, std::memory_order_relaxed);
+
+        // Ritenta pigramente sul main thread per framework React Native caricati dopo il login/apertura tab
+        for (NSNumber *delaySec in @[@(1.5), @(4.0), @(8.0)]) {
+            double d = delaySec.doubleValue;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                FFBInstallAvailableAdHooksNow();
+            });
+        }
     });
 }
 
 void FocusFBInstallAdBlocker(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        FFBInstallAvailableAdHooksNow();
-        _dyld_register_func_for_add_image(FFBAdBlockDyldImageAdded);
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                          object:nil
+                                                           queue:[NSOperationQueue mainQueue]
+                                                      usingBlock:^(__unused NSNotification *note) {
+            FFBActivateAdBlockerAfterBecomeActive();
+        }];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
+                FFBActivateAdBlockerAfterBecomeActive();
+            }
+        });
     });
 }
