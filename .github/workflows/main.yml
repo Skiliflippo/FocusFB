@@ -54,12 +54,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Auto-estrazione e pulizia repo (se caricato FocusFB-Repo-v2.4.zip via web)
+      - name: Auto-estrazione e pulizia repo (se caricato FocusFB-Repo-v2.5.zip via web)
         if: github.event_name != 'pull_request'
         run: |
           set -euo pipefail
           ZIP_CANDIDATE=""
-          for f in FocusFB-Repo-v2.4.zip FocusFB-Repo*.zip; do
+          for f in FocusFB-Repo-v2.5.zip FocusFB-Repo*.zip; do
             if [[ -f "$f" ]]; then
               ZIP_CANDIDATE="$f"
               break
@@ -68,7 +68,7 @@ jobs:
 
           if [[ -n "$ZIP_CANDIDATE" ]]; then
             echo "Trovato $ZIP_CANDIDATE: estrazione file puliti e rimozione vecchi zip..."
-            CLEAN_TMP="$RUNNER_TEMP/clean_repo_v24"
+            CLEAN_TMP="$RUNNER_TEMP/clean_repo_v25"
             rm -rf "$CLEAN_TMP"
             mkdir -p "$CLEAN_TMP"
             unzip -q -o "$ZIP_CANDIDATE" -d "$CLEAN_TMP"
@@ -86,7 +86,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
             if ! git diff --cached --quiet; then
-              git commit -m "FocusFB v2.4: clean open-source repository structure"
+              git commit -m "FocusFB v2.5: clean open-source repository structure"
               if [[ "${GITHUB_REF}" == refs/heads/* ]]; then
                 git push origin "HEAD:${GITHUB_REF_NAME}"
                 echo "Repository ripulito e aggiornato automaticamente su GitHub!"
@@ -128,6 +128,8 @@ jobs:
             src/FocusFBSettingsViewController.mm \
             src/FocusFBLockManager.mm \
             src/FocusFBAdBlocker.mm \
+            src/FocusFBStoriesManager.mm \
+            src/FocusFBMediaDownloader.mm \
             -lobjc \
             -framework Foundation \
             -framework CoreFoundation \
@@ -136,7 +138,9 @@ jobs:
             -framework CoreGraphics \
             -framework Security \
             -framework AVFoundation \
+            -framework CoreMedia \
             -framework CoreImage \
+            -framework Photos \
             -weak_framework CoreNFC \
             -o dist/FocusFB.dylib
 
@@ -190,7 +194,7 @@ jobs:
           unzip -tq "$IPA_IN" >/dev/null
 
           MERGE_PLIST="$RUNNER_TEMP/focusfb_info_merge.plist"
-          python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scan NFC tag to unlock FocusFB"}, open(sys.argv[1], "wb"))' "$MERGE_PLIST"
+          python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scan physical NFC tag to unlock FocusFB", "NSCameraUsageDescription": "Scan physical QR or barcode to unlock FocusFB", "NSPhotoLibraryAddUsageDescription": "Save downloaded photos and videos to your Camera Roll", "NSPhotoLibraryUsageDescription": "Save downloaded photos and videos to your Photo Library"}, open(sys.argv[1], "wb"))' "$MERGE_PLIST"
 
           pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
 
@@ -223,8 +227,8 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_public_release == true) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.4.0' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'FocusFB v2.4.0' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.5.0' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'FocusFB v2.5.0' }}
           files: |
             dist/FocusFB.dylib
             dist/*.deb
