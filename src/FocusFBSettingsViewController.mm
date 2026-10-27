@@ -8,6 +8,7 @@
 typedef NS_ENUM(NSInteger, FFBSectionIndex) {
     FFBSectionMaster = 0,
     FFBSectionAdBlock,
+    FFBSectionMediaPrivacy,
     FFBSectionFoqosLock,
     FFBSectionPresets,
     FFBSectionTabs,
@@ -40,6 +41,7 @@ typedef NS_ENUM(NSInteger, FFBSectionIndex) {
 @property (nonatomic, assign) BOOL sessionUnlocked;
 @property (nonatomic, strong) NSArray<FFBSettingItem *> *masterItems;
 @property (nonatomic, strong) NSArray<FFBSettingItem *> *adBlockItems;
+@property (nonatomic, strong) NSArray<FFBSettingItem *> *mediaPrivacyItems;
 @property (nonatomic, strong) NSArray<FFBSettingItem *> *foqosItems;
 @property (nonatomic, strong) NSArray<FFBSettingItem *> *presetItems;
 @property (nonatomic, strong) NSArray<FFBSettingItem *> *tabItems;
@@ -456,7 +458,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
                     ^(FocusFBPrefs *p, BOOL v) { p.enabled = v; })
     ];
 
-    // ── Pubblicità ──
+    // ── Pubblicità e Pulizia Feed (stile Glow / Wolf) ──
     FFBSettingItem *adBlockItem = FFBBoolItem(@"AdBlock.EnableAll", @"AdBlock.EnableAllDesc", @"shield.lefthalf.filled", [UIColor systemGreenColor],
                                               ^BOOL(FocusFBPrefs *p) { return p.blockAllAds; },
                                               ^(FocusFBPrefs *p, BOOL v) { p.blockAllAds = v; });
@@ -468,13 +470,41 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
                                        FFBIsItalianLocale() ? @"bloccate" : @"blocked"];
     }
 
+    FFBSettingItem *pymkItem = FFBBoolItem(@"AdBlock.HidePYMK", @"AdBlock.HidePYMKDesc", @"person.2.slash.fill", [UIColor systemOrangeColor],
+                                           ^BOOL(FocusFBPrefs *p) { return p.hidePeopleYouMayKnow; },
+                                           ^(FocusFBPrefs *p, BOOL v) { p.hidePeopleYouMayKnow = v; });
+
+    FFBSettingItem *reelsCarouselItem = FFBBoolItem(@"AdBlock.HideReelsCarousel", @"AdBlock.HideReelsCarouselDesc", @"film.stack", [UIColor systemPinkColor],
+                                                    ^BOOL(FocusFBPrefs *p) { return p.hideReelsCarousel; },
+                                                    ^(FocusFBPrefs *p, BOOL v) { p.hideReelsCarousel = v; });
+
     FFBSettingItem *suggestedItem = FFBBoolItem(@"AdBlock.HideSuggested", @"AdBlock.HideSuggestedDesc", @"rectangle.on.rectangle.slash", [UIColor systemMintColor],
                                                 ^BOOL(FocusFBPrefs *p) { return p.hideSuggestedClutter; },
                                                 ^(FocusFBPrefs *p, BOOL v) { p.hideSuggestedClutter = v; });
 
-    self.adBlockItems = @[ adBlockItem, suggestedItem ];
+    FFBSettingItem *storiesTrayItem = FFBBoolItem(@"AdBlock.HideStoriesTray", @"AdBlock.HideStoriesTrayDesc", @"circle.dashed", [UIColor systemPurpleColor],
+                                                  ^BOOL(FocusFBPrefs *p) { return p.hideStoriesTray; },
+                                                  ^(FocusFBPrefs *p, BOOL v) { p.hideStoriesTray = v; });
 
-    // ── Blocco con chiave fisica (Foqos) ──
+    self.adBlockItems = @[ adBlockItem, pymkItem, reelsCarouselItem, suggestedItem, storiesTrayItem ];
+
+    // ── Download Media & Storie in Incognito ──
+    self.mediaPrivacyItems = @[
+        FFBBoolItem(@"Media.EnableDownload", @"Media.EnableDownloadDesc", @"arrow.down.circle.fill", [UIColor systemBlueColor],
+                    ^BOOL(FocusFBPrefs *p) { return p.enableMediaDownload; },
+                    ^(FocusFBPrefs *p, BOOL v) { p.enableMediaDownload = v; }),
+        FFBBoolItem(@"Media.ShowButton", @"Media.ShowButtonDesc", @"arrow.down.to.line.circle.fill", [UIColor systemCyanColor],
+                    ^BOOL(FocusFBPrefs *p) { return p.showMediaDownloadButton; },
+                    ^(FocusFBPrefs *p, BOOL v) { p.showMediaDownloadButton = v; }),
+        FFBBoolItem(@"Stories.Incognito", @"Stories.IncognitoDesc", @"eye.slash.circle.fill", [UIColor systemPurpleColor],
+                    ^BOOL(FocusFBPrefs *p) { return p.storiesIncognitoMode; },
+                    ^(FocusFBPrefs *p, BOOL v) { p.storiesIncognitoMode = v; }),
+        FFBBoolItem(@"Stories.NoAutoAdvance", @"Stories.NoAutoAdvanceDesc", @"pause.circle.fill", [UIColor systemIndigoColor],
+                    ^BOOL(FocusFBPrefs *p) { return p.storiesDisableAutoAdvance; },
+                    ^(FocusFBPrefs *p, BOOL v) { p.storiesDisableAutoAdvance = v; })
+    ];
+
+    // ── Blocco con chiave fisica (Foqos — solo Feed/Reels/Social, mai Marketplace) ──
     FFBSettingItem *keyStatus = [[FFBSettingItem alloc] init];
     keyStatus.titleKey = @"Lock.KeyStatusRow";
     keyStatus.dynamicSubtitle = [NSString stringWithFormat:@"%@  •  %@",
@@ -507,21 +537,11 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
         }];
     });
 
-    BOOL isExceptMP = (lockMgr.lockScope == FFBLockScopeExceptMarketplace);
-    FFBSettingItem *scopeItem = FFBActionItem(@"Lock.ScopeRow",
-                                              isExceptMP ? @"Lock.ScopeExceptMPDesc" : @"Lock.ScopeEntireAppDesc",
-                                              isExceptMP ? @"bag.fill" : @"iphone",
-                                              isExceptMP ? [UIColor systemGreenColor] : [UIColor systemOrangeColor],
-                                              ^(FocusFBSettingsViewController *vc, UITableViewCell *cell) {
-        [vc promptLockScopePickerFromCell:cell];
-    });
-    scopeItem.valueBadgeText = isExceptMP ? FFBLoc(@"Lock.ScopeExceptMPBadge") : FFBLoc(@"Lock.ScopeEntireAppBadge");
-
     FFBSettingItem *sessionLim = FFBActionItem(@"Lock.SessionLimit", @"Lock.SessionLimitDesc",
                                                @"timer", [UIColor systemOrangeColor],
                                                ^(FocusFBSettingsViewController *vc, UITableViewCell *cell) {
         [vc promptMinutesPickerWithTitle:FFBLoc(@"Lock.SessionLimit")
-                                 options:@[@0, @(-1), @2, @5, @10, @15, @20, @30, @45, @60]
+                                 options:@[@(-1), @0, @2, @5, @10, @15, @20, @30, @45, @60]
                               sourceCell:cell
                                 onSelect:^(NSInteger mins) {
             [FocusFBLockManager shared].sessionLimitMinutes = mins;
@@ -602,7 +622,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
 
     self.foqosItems = @[
         keyStatus, regCamera, genQR, regNFC,
-        scopeItem, sessionLim, cooldownLim, dailyLim,
+        sessionLim, cooldownLim, dailyLim,
         pillToggle, emergencyToggle, resetTimersItem, strictBtn
     ];
 
@@ -675,10 +695,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
                     ^(FocusFBPrefs *p, BOOL v) { p.shieldHomeFeed = v; }),
         FFBBoolItem(@"Shield.BlockReels", @"Shield.BlockReelsDesc", @"hand.raised.fill", [UIColor systemRedColor],
                     ^BOOL(FocusFBPrefs *p) { return p.blockReelsEverywhere; },
-                    ^(FocusFBPrefs *p, BOOL v) { p.blockReelsEverywhere = v; }),
-        FFBBoolItem(@"Shield.HideStories", @"Shield.HideStoriesDesc", @"rectangle.slash.fill", [UIColor systemOrangeColor],
-                    ^BOOL(FocusFBPrefs *p) { return p.hideStoriesAndInlineReels; },
-                    ^(FocusFBPrefs *p, BOOL v) { p.hideStoriesAndInlineReels = v; })
+                    ^(FocusFBPrefs *p, BOOL v) { p.blockReelsEverywhere = v; })
     ];
 
     // ── Accesso impostazioni ──
@@ -808,18 +825,16 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
         return;
     }
 
-    NSString *scopeName = (mgr.lockScope == FFBLockScopeExceptMarketplace)
-        ? FFBLoc(@"Lock.ScopeExceptMPTitle")
-        : FFBLoc(@"Lock.ScopeEntireAppTitle");
+    NSString *scopeName = FFBLoc(@"Lock.ScopeExceptMPBadge");
 
     NSString *msg = FFBIsItalianLocale()
-        ? [NSString stringWithFormat:@"Ambito: %@\nChiave: %@\nSessione: %@ • Pausa: %@ • Giorno: %@",
+        ? [NSString stringWithFormat:@"Ambito: %@ (Marketplace sempre libero)\nChiave: %@\nSessione: %@ • Pausa: %@ • Giorno: %@",
            scopeName,
            [mgr registeredKeyDescription],
            FFBFormatMinutesBadge(mgr.sessionLimitMinutes),
            FFBFormatMinutesBadge(mgr.cooldownMinutes),
            FFBFormatMinutesBadge(mgr.dailyLimitMinutes)]
-        : [NSString stringWithFormat:@"Scope: %@\nKey: %@\nSession: %@ • Break: %@ • Daily: %@",
+        : [NSString stringWithFormat:@"Scope: %@ (Marketplace always open)\nKey: %@\nSession: %@ • Break: %@ • Daily: %@",
            scopeName,
            [mgr registeredKeyDescription],
            FFBFormatMinutesBadge(mgr.sessionLimitMinutes),
@@ -832,7 +847,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
     __weak FocusFBSettingsViewController *weakSelf = self;
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
     BOOL allExtraTabsHidden = (!prefs.showHomeTab && !prefs.showGroupsTab && !prefs.showNotificationsTab && !prefs.showFriendsTab && !prefs.showProfileTab);
-    BOOL hasAllowanceForExtra = (mgr.lockScope == FFBLockScopeExceptMarketplace && (mgr.sessionLimitMinutes > 0 || mgr.dailyLimitMinutes > 0));
+    BOOL hasAllowanceForExtra = (mgr.sessionLimitMinutes > 0 || mgr.dailyLimitMinutes > 0);
 
     if (hasAllowanceForExtra && allExtraTabsHidden) {
         NSString *enableAndLockTitle = FFBIsItalianLocale()
@@ -886,32 +901,6 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
     [self presentViewController:confirm animated:YES completion:nil];
 }
 
-- (void)promptLockScopePickerFromCell:(nullable UITableViewCell *)sourceCell {
-    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:FFBLoc(@"Lock.ScopeRow")
-                                                                   message:FFBLoc(@"Lock.ScopeExceptMPDesc")
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
-    __weak FocusFBSettingsViewController *weakSelf = self;
-    [sheet addAction:[UIAlertAction actionWithTitle:FFBLoc(@"Lock.ScopeExceptMPTitle")
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
-        [FocusFBLockManager shared].lockScope = FFBLockScopeExceptMarketplace;
-        [weakSelf refreshAllDataAnimated];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:FFBLoc(@"Lock.ScopeEntireAppTitle")
-                                              style:UIAlertActionStyleDefault
-                                            handler:^(__unused UIAlertAction *a) {
-        [FocusFBLockManager shared].lockScope = FFBLockScopeEntireApp;
-        [weakSelf refreshAllDataAnimated];
-    }]];
-    [sheet addAction:[UIAlertAction actionWithTitle:FFBLoc(@"Cancel") style:UIAlertActionStyleCancel handler:nil]];
-
-    if (sheet.popoverPresentationController) {
-        sheet.popoverPresentationController.sourceView = sourceCell ?: self.view;
-        sheet.popoverPresentationController.sourceRect = sourceCell ? sourceCell.bounds : CGRectMake(CGRectGetMidX(self.view.bounds), CGRectGetMidY(self.view.bounds), 1, 1);
-    }
-    [self presentViewController:sheet animated:YES completion:nil];
-}
-
 - (void)promptMinutesPickerWithTitle:(NSString *)title
                              options:(NSArray<NSNumber *> *)options
                           sourceCell:(nullable UITableViewCell *)sourceCell
@@ -944,16 +933,23 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
     [self.tableView setContentOffset:CGPointZero animated:YES];
 }
 
+- (BOOL)isSectionAlwaysEditable:(NSInteger)section {
+    return (section == FFBSectionAbout ||
+            section == FFBSectionMediaPrivacy ||
+            section == FFBSectionAdBlock);
+}
+
 - (void)switchValueChanged:(UISwitch *)sender {
-    if ([self isEditingLocked]) {
+    NSInteger section = sender.tag >> 16;
+    NSInteger row = sender.tag & 0xFFFF;
+
+    if (![self isSectionAlwaysEditable:section] && [self isEditingLocked]) {
         BOOL cur = !sender.isOn;
         [sender setOn:cur animated:YES];
         [self notifyEditingBlocked];
         return;
     }
 
-    NSInteger section = sender.tag >> 16;
-    NSInteger row = sender.tag & 0xFFFF;
     NSArray<FFBSettingItem *> *list = [self itemsForStandardSection:section];
     if (row < 0 || (NSUInteger)row >= list.count) return;
 
@@ -974,15 +970,16 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
 
 - (NSArray<FFBSettingItem *> *)itemsForStandardSection:(NSInteger)section {
     switch (section) {
-        case FFBSectionMaster:    return self.masterItems;
-        case FFBSectionAdBlock:   return self.adBlockItems;
-        case FFBSectionFoqosLock: return self.foqosItems;
-        case FFBSectionPresets:   return self.presetItems;
-        case FFBSectionTabs:      return self.tabItems;
-        case FFBSectionShields:   return self.shieldItems;
-        case FFBSectionShortcuts: return self.shortcutItems;
-        case FFBSectionAbout:     return self.aboutItems;
-        default:                  return @[];
+        case FFBSectionMaster:       return self.masterItems;
+        case FFBSectionAdBlock:      return self.adBlockItems;
+        case FFBSectionMediaPrivacy: return self.mediaPrivacyItems;
+        case FFBSectionFoqosLock:    return self.foqosItems;
+        case FFBSectionPresets:      return self.presetItems;
+        case FFBSectionTabs:         return self.tabItems;
+        case FFBSectionShields:      return self.shieldItems;
+        case FFBSectionShortcuts:    return self.shortcutItems;
+        case FFBSectionAbout:        return self.aboutItems;
+        default:                     return @[];
     }
 }
 
@@ -1005,16 +1002,17 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
         return nil;
     }
     switch (section) {
-        case FFBSectionMaster:     return FFBLoc(@"Sec.Master");
-        case FFBSectionAdBlock:    return FFBLoc(@"Sec.AdBlock");
-        case FFBSectionFoqosLock:  return FFBLoc(@"Sec.FoqosLock");
-        case FFBSectionPresets:    return FFBLoc(@"Sec.Presets");
-        case FFBSectionTabs:       return FFBLoc(@"Sec.Tabs");
-        case FFBSectionShields:    return FFBLoc(@"Sec.Shields");
-        case FFBSectionShortcuts:  return FFBLoc(@"Sec.Shortcuts");
-        case FFBSectionDiscovered: return FFBLoc(@"Sec.Discovered");
-        case FFBSectionAbout:      return FFBLoc(@"Sec.About");
-        default:                   return nil;
+        case FFBSectionMaster:       return FFBLoc(@"Sec.Master");
+        case FFBSectionAdBlock:      return FFBLoc(@"Sec.AdBlock");
+        case FFBSectionMediaPrivacy: return FFBLoc(@"Sec.MediaPrivacy");
+        case FFBSectionFoqosLock:    return FFBLoc(@"Sec.FoqosLock");
+        case FFBSectionPresets:      return FFBLoc(@"Sec.Presets");
+        case FFBSectionTabs:         return FFBLoc(@"Sec.Tabs");
+        case FFBSectionShields:      return FFBLoc(@"Sec.Shields");
+        case FFBSectionShortcuts:    return FFBLoc(@"Sec.Shortcuts");
+        case FFBSectionDiscovered:   return FFBLoc(@"Sec.Discovered");
+        case FFBSectionAbout:        return FFBLoc(@"Sec.About");
+        default:                     return nil;
     }
 }
 
@@ -1023,13 +1021,14 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
         return nil;
     }
     switch (section) {
-        case FFBSectionAdBlock:    return FFBLoc(@"Sec.AdBlockFooter");
-        case FFBSectionFoqosLock:  return FFBLoc(@"Sec.FoqosLockFooter");
-        case FFBSectionTabs:       return FFBLoc(@"Sec.TabsFooter");
-        case FFBSectionShields:    return FFBLoc(@"Sec.ShieldsFooter");
-        case FFBSectionShortcuts:  return FFBLoc(@"Sec.ShortcutsFooter");
-        case FFBSectionDiscovered: return FFBLoc(@"Sec.DiscoveredFooter");
-        default:                   return nil;
+        case FFBSectionAdBlock:      return FFBLoc(@"Sec.AdBlockFooter");
+        case FFBSectionMediaPrivacy: return FFBLoc(@"Sec.MediaPrivacyFooter");
+        case FFBSectionFoqosLock:    return FFBLoc(@"Sec.FoqosLockFooter");
+        case FFBSectionTabs:         return FFBLoc(@"Sec.TabsFooter");
+        case FFBSectionShields:      return FFBLoc(@"Sec.ShieldsFooter");
+        case FFBSectionShortcuts:    return FFBLoc(@"Sec.ShortcutsFooter");
+        case FFBSectionDiscovered:   return FFBLoc(@"Sec.DiscoveredFooter");
+        default:                     return nil;
     }
 }
 
@@ -1049,8 +1048,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
         cell.detailTextLabel.numberOfLines = 0;
     }
 
-    BOOL isAboutSection = (indexPath.section == FFBSectionAbout);
-    BOOL locked = isAboutSection ? NO : [self isEditingLocked];
+    BOOL locked = [self isSectionAlwaysEditable:indexPath.section] ? NO : [self isEditingLocked];
     FFBSettingItem *item = [self itemsForStandardSection:indexPath.section][(NSUInteger)indexPath.row];
     cell.textLabel.text = FFBLoc(item.titleKey);
     cell.textLabel.textColor = locked ? [UIColor secondaryLabelColor] : [UIColor labelColor];
@@ -1132,7 +1130,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    if (indexPath.section != FFBSectionAbout && [self isEditingLocked]) {
+    if (![self isSectionAlwaysEditable:indexPath.section] && [self isEditingLocked]) {
         [self notifyEditingBlocked];
         return;
     }

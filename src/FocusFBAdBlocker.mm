@@ -1,5 +1,6 @@
 #import "FocusFBAdBlocker.h"
 #import "FocusFBPrefs.h"
+#import "FocusFBStoriesManager.h"
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -16,6 +17,7 @@
 @end
 
 @protocol FFBRCTURLRequestDelegate <NSObject>
+- (void)URLRequest:(id)requestToken didReceiveResponse:(NSURLResponse *)response;
 - (void)URLRequest:(id)requestToken didReceiveData:(NSData *)data;
 - (void)URLRequest:(id)requestToken didCompleteWithError:(nullable NSError *)error;
 @end
@@ -28,26 +30,48 @@
 static std::atomic<uint64_t> gBlockedAdsCount{0};
 static thread_local bool gInsideInternalJSONPass = false;
 
-static char kCellHiddenByAdBlockKey;
-static char kCellCountedByAdBlockKey;
-
 typedef id (*FFBPandoInitIMP)(id, SEL, void *);
 typedef id (*FFBJSONDataIMP)(id, SEL, NSData *, NSJSONReadingOptions, NSError * __autoreleasing *);
 typedef id (*FFBRCTHandlerIMP)(id, SEL, NSURLRequest *);
-typedef void (*FFBVoidIMP)(id, SEL);
 
 static FFBPandoInitIMP  gOrigInitWithPandoTree = NULL;
 static FFBPandoInitIMP  gOrigInitWithFBTree    = NULL;
 static FFBJSONDataIMP   gOrigJSONWithData      = NULL;
 static FFBRCTHandlerIMP gOrigRCTHandlerForReq  = NULL;
-static FFBVoidIMP       gOrigCellLayout        = NULL;
-static FFBVoidIMP       gOrigCellPrepareReuse  = NULL;
 
-static BOOL gInstalledPandoHook    = NO;
-static BOOL gInstalledFBTreeHook   = NO;
-static BOOL gInstalledJSONHook     = NO;
-static BOOL gInstalledRCTHook      = NO;
-static BOOL gInstalledCellHooks    = NO;
+static BOOL gInstalledPandoHook  = NO;
+static BOOL gInstalledFBTreeHook = NO;
+static BOOL gInstalledJSONHook   = NO;
+static BOOL gInstalledRCTHook    = NO;
+
+struct FFBFilterFlags {
+    BOOL blockAds;
+    BOOL hidePYMK;
+    BOOL hideReelsCarousel;
+    BOOL hideSuggested;
+    BOOL hideStoriesTray;
+
+    bool anyActive() const noexcept {
+        return blockAds || hidePYMK || hideReelsCarousel || hideSuggested || hideStoriesTray;
+    }
+    bool anyJSONActive() const noexcept {
+        return blockAds || hidePYMK || hideReelsCarousel || hideSuggested;
+    }
+};
+
+static inline FFBFilterFlags FFBReadCurrentFilterFlags(void) {
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    if (!prefs.enabled) {
+        return FFBFilterFlags{NO, NO, NO, NO, NO};
+    }
+    return FFBFilterFlags{
+        prefs.blockAllAds,
+        prefs.hidePeopleYouMayKnow,
+        prefs.hideReelsCarousel,
+        prefs.hideSuggestedClutter,
+        prefs.hideStoriesTray
+    };
+}
 
 NSUInteger FocusFBBlockedAdsCount(void) {
     return (NSUInteger)gBlockedAdsCount.load(std::memory_order_relaxed);
@@ -107,7 +131,7 @@ static BOOL FFBInstallMethodHook(Class cls, SEL sel, IMP newIMP, IMP *origOut) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Riconoscimento Unificato Nodi/Edge Pubblicitari JSON (Marketplace + Feed)
+// Riconoscimento Unificato Nodi/Edge Pubblicitari, PYMK & Reels Carousel
 // ─────────────────────────────────────────────────────────────────────────────
 
 static inline BOOL FFBHasNonNullValue(NSDictionary *dict, NSString *key) {
@@ -117,48 +141,100 @@ static inline BOOL FFBHasNonNullValue(NSDictionary *dict, NSString *key) {
 
 static BOOL FFBIsAdTypenameString(NSString *tn) {
     if (![tn isKindOfClass:NSString.class] || tn.length < 4) return NO;
-    // Match sicuro: "Ad" o "Ads" seguito da lettera maiuscola (es. MarketplaceFeedAdStory,
-    // MarketplaceSearchAdStory, MarketplaceAdsBlendedFeedUnit, AdsFeedUnit, StoryAdUnit)
-    // oppure "Sponsored", così parole normali come "Address" o "Additional" non matchano mai.
     static NSRegularExpression *adTypeRegex = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        adTypeRegex = [NSRegularExpression regularExpressionWithPattern:@"(?:Ads?[A-Z])|Sponsored|(?:StoryAd$)|(?:BannerAd$)"
-                                                                options:0
-                                                                  error:nil];
+        adTypeRegex = [NSRegularExpression
+            regularExpressionWithPattern:@"(?:Ads?[A-Z])|Sponsored|(?:StoryAd$)|(?:BannerAd$)"
+                                 options:0
+                                   error:nil];
     });
     return [adTypeRegex firstMatchInString:tn options:0 range:NSMakeRange(0, tn.length)] != nil;
 }
 
-static BOOL FFBDictHasDirectAdMarkers(NSDictionary *d, BOOL blockAds, BOOL hideSuggested) {
+static BOOL FFBIsPYMKTypenameString(NSString *tn) {
+    if (![tn isKindOfClass:NSString.class] || tn.length < 4) return NO;
+    return ([tn rangeOfString:@"PeopleYouMayKnow" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"PYMK" options:0].location != NSNotFound ||
+            [tn rangeOfString:@"FriendingPossibilities" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"FriendSuggestions" options:NSCaseInsensitiveSearch].location != NSNotFound);
+}
+
+static BOOL FFBIsReelsCarouselTypenameString(NSString *tn) {
+    if (![tn isKindOfClass:NSString.class] || tn.length < 6) return NO;
+    // Matcha solo unità/caroselli nel Feed (es. FbShortsFeedUnit, ReelsFeedUnit, ClipsHomeUnit),
+    // mai il singolo oggetto video riprodotto quando apri intenzionalmente un video.
+    return ([tn rangeOfString:@"ShortsFeedUnit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ShortsInFeed" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ReelsFeedUnit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ReelsTray" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ReelsHScroll" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ClipsHomeUnit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ShortFormVideoFeedUnit" options:NSCaseInsensitiveSearch].location != NSNotFound);
+}
+
+static BOOL FFBIsSuggestedTypenameString(NSString *tn) {
+    if (![tn isKindOfClass:NSString.class] || tn.length < 6) return NO;
+    return ([tn rangeOfString:@"GroupsYouShouldJoin" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"PagesYouMayLike" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"ThreadsInFeed" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"SingleBucketInlineViewer" options:NSCaseInsensitiveSearch].location != NSNotFound);
+}
+
+static BOOL FFBDictHasDirectFilterMarkers(NSDictionary *d, const FFBFilterFlags &flags, BOOL *outIsAd) {
     if (![d isKindOfClass:NSDictionary.class]) return NO;
 
     NSString *cat = d[@"category"];
     if ([cat isKindOfClass:NSString.class]) {
-        if (blockAds &&
+        if (flags.blockAds &&
             ([cat isEqualToString:@"SPONSORED"] ||
              [cat isEqualToString:@"AD"] ||
              [cat isEqualToString:@"ADS"] ||
              [cat isEqualToString:@"MARKETPLACE_ADS"] ||
              [cat isEqualToString:@"SPONSORED_STORY"] ||
              [cat containsString:@"SPONSOR"])) {
+            if (outIsAd) *outIsAd = YES;
             return YES;
         }
-        if (hideSuggested &&
+        if (flags.hidePYMK &&
+            ([cat isEqualToString:@"PYMK"] ||
+             [cat isEqualToString:@"PYMK_STORY"] ||
+             [cat isEqualToString:@"FRIENDING"])) {
+            return YES;
+        }
+        if (flags.hideReelsCarousel &&
+            ([cat isEqualToString:@"FB_SHORTS"] ||
+             [cat isEqualToString:@"FB_SHORTS_FALLBACK"] ||
+             [cat isEqualToString:@"SHORT_FORM_VIDEO"] ||
+             [cat containsString:@"FB_SHORTS"])) {
+            return YES;
+        }
+        if (flags.hideSuggested &&
             ([cat isEqualToString:@"ENGAGEMENT"] ||
              [cat isEqualToString:@"ENGAGEMENT_QP"] ||
-             [cat isEqualToString:@"PYMK"] ||
-             [cat isEqualToString:@"PYMK_STORY"])) {
+             [cat isEqualToString:@"RECOMMENDATION"])) {
             return YES;
         }
     }
 
-    if (!blockAds) return NO;
-
     NSString *tn = d[@"__typename"];
-    if ([tn isKindOfClass:NSString.class] && FFBIsAdTypenameString(tn)) {
-        return YES;
+    if ([tn isKindOfClass:NSString.class]) {
+        if (flags.blockAds && FFBIsAdTypenameString(tn)) {
+            if (outIsAd) *outIsAd = YES;
+            return YES;
+        }
+        if (flags.hidePYMK && FFBIsPYMKTypenameString(tn)) {
+            return YES;
+        }
+        if (flags.hideReelsCarousel && FFBIsReelsCarouselTypenameString(tn)) {
+            return YES;
+        }
+        if (flags.hideSuggested && FFBIsSuggestedTypenameString(tn)) {
+            return YES;
+        }
     }
+
+    if (!flags.blockAds) return NO;
 
     if (FFBHasNonNullValue(d, @"sponsored_data") ||
         FFBHasNonNullValue(d, @"ad_data") ||
@@ -166,54 +242,95 @@ static BOOL FFBDictHasDirectAdMarkers(NSDictionary *d, BOOL blockAds, BOOL hideS
         FFBHasNonNullValue(d, @"boosted_marketplace_listing") ||
         FFBHasNonNullValue(d, @"promoted_listing_info") ||
         FFBHasNonNullValue(d, @"ad_impression_client_token")) {
+        if (outIsAd) *outIsAd = YES;
         return YES;
     }
 
     id adId = d[@"ad_id"];
     if ([adId isKindOfClass:NSString.class] && ((NSString *)adId).length > 0) {
+        if (outIsAd) *outIsAd = YES;
         return YES;
     }
 
     id isSpons = d[@"is_sponsored"];
     if ([isSpons isKindOfClass:NSNumber.class] && [(NSNumber *)isSpons boolValue]) {
+        if (outIsAd) *outIsAd = YES;
         return YES;
     }
 
     return NO;
 }
 
-static BOOL FFBIsSponsoredJSONItem(id item, BOOL blockAds, BOOL hideSuggested) {
+static BOOL FFBShouldDropJSONItem(id item, const FFBFilterFlags &flags, BOOL *outIsAd) {
     if (![item isKindOfClass:NSDictionary.class]) return NO;
     NSDictionary *dict = (NSDictionary *)item;
 
-    // Non rimuovere mai un dizionario di metadati che è esso stesso sponsored_data,
-    // ma rimuovi l'elemento dell'array (edge / unit / card) che lo contiene o il cui node/story/listing è sponsorizzato.
-    if (FFBDictHasDirectAdMarkers(dict, blockAds, hideSuggested)) return YES;
+    if (FFBDictHasDirectFilterMarkers(dict, flags, outIsAd)) return YES;
 
     NSDictionary *node = [dict[@"node"] isKindOfClass:NSDictionary.class] ? dict[@"node"] : nil;
     if (node) {
-        if (FFBDictHasDirectAdMarkers(node, blockAds, hideSuggested)) return YES;
+        if (FFBDictHasDirectFilterMarkers(node, flags, outIsAd)) return YES;
         NSDictionary *nodeStory = [node[@"story"] isKindOfClass:NSDictionary.class] ? node[@"story"] : nil;
-        if (nodeStory && FFBDictHasDirectAdMarkers(nodeStory, blockAds, hideSuggested)) return YES;
+        if (nodeStory && FFBDictHasDirectFilterMarkers(nodeStory, flags, outIsAd)) return YES;
         NSDictionary *nodeListing = [node[@"listing"] isKindOfClass:NSDictionary.class] ? node[@"listing"] : nil;
-        if (nodeListing && FFBDictHasDirectAdMarkers(nodeListing, blockAds, hideSuggested)) return YES;
+        if (nodeListing && FFBDictHasDirectFilterMarkers(nodeListing, flags, outIsAd)) return YES;
     }
 
     NSDictionary *story = [dict[@"story"] isKindOfClass:NSDictionary.class] ? dict[@"story"] : nil;
-    if (story && FFBDictHasDirectAdMarkers(story, blockAds, hideSuggested)) return YES;
+    if (story && FFBDictHasDirectFilterMarkers(story, flags, outIsAd)) return YES;
 
     NSDictionary *listing = [dict[@"listing"] isKindOfClass:NSDictionary.class] ? dict[@"listing"] : nil;
-    if (listing && FFBDictHasDirectAdMarkers(listing, blockAds, hideSuggested)) return YES;
+    if (listing && FFBDictHasDirectFilterMarkers(listing, flags, outIsAd)) return YES;
 
+    return NO;
+}
+
+static inline BOOL FFBBytesContainASCII(const uint8_t *buf, size_t bufLen, const char *pat, size_t patLen) {
+    const uint8_t *p = reinterpret_cast<const uint8_t *>(pat);
+    return std::search(buf, buf + bufLen, p, p + patLen) != (buf + bufLen);
+}
+
+// Fast-path C++ sub-millisecondo: evita conversione NSString e NSJSONSerialization
+// sulle pagine pulite di Marketplace durante lo scroll veloce!
+static BOOL FFBDataMayContainFilterableTokens(NSData *data, const FFBFilterFlags &flags) {
+    const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
+    size_t len = (size_t)data.length;
+    if (!bytes || len < 48) return NO;
+
+    if (flags.blockAds) {
+        if (FFBBytesContainASCII(bytes, len, "sponsored", 9)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "SPONSORED", 9)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "Sponsored", 9)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "ad_data", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "\"ad_id\"", 7)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "boosted_", 8))  return YES;
+        if (FFBBytesContainASCII(bytes, len, "promoted_", 9)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "AdStory", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "AdsFeed", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "AdUnit", 6))    return YES;
+        if (FFBBytesContainASCII(bytes, len, "BannerAd", 8))  return YES;
+    }
+    if (flags.hidePYMK) {
+        if (FFBBytesContainASCII(bytes, len, "PYMK", 4))             return YES;
+        if (FFBBytesContainASCII(bytes, len, "PeopleYouMayKnow", 16)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "FriendingPossib", 15))  return YES;
+    }
+    if (flags.hideReelsCarousel) {
+        if (FFBBytesContainASCII(bytes, len, "FB_SHORTS", 9))      return YES;
+        if (FFBBytesContainASCII(bytes, len, "ShortsFeedUnit", 14)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "ReelsFeedUnit", 13))  return YES;
+    }
+    if (flags.hideSuggested) {
+        if (FFBBytesContainASCII(bytes, len, "ENGAGEMENT", 10))         return YES;
+        if (FFBBytesContainASCII(bytes, len, "GroupsYouShouldJoin", 19)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "PagesYouMayLike", 15))     return YES;
+        if (FFBBytesContainASCII(bytes, len, "ThreadsInFeed", 13))       return YES;
+    }
     return NO;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTORE 1: React Native RCTNetworking (Marketplace Home, Search, Categorie, PDP)
-// Facebook iOS v575-v585+ renderizza Marketplace in React Native + Hermes C++:
-// Hermes fa JSON.parse() in C++, bypassando FBMemModelObject e NSJSONSerialization!
-// Intercettando -[RCTNetworking handlerForRequest:] blocchiamo il 100% degli annunci
-// Marketplace sia nelle query dedicate sia negli edge blended (inclusi stream \n).
 // ─────────────────────────────────────────────────────────────────────────────
 
 static NSString *FFBRCTExtractFriendlyName(NSURLRequest *request) {
@@ -266,8 +383,6 @@ static BOOL FFBIsDedicatedAdQueryName(NSString *name) {
             @"MarketplaceCategoryFeedAdsQuery",
             @"MarketplaceBrowseAdsQuery"
         ]];
-        // "Ad"/"Ads" seguito da lettera maiuscola o direttamente da "Query",
-        // così "MarketplaceAddress..." o "MarketplaceAddListing..." non vengono mai toccati.
         adQueryRegex = [NSRegularExpression
             regularExpressionWithPattern:@"(?:^Marketplace\\w*Ads?(?:[A-Z]\\w*)?Query$)|(?:AdsQueryRendererQuery$)|(?:BoostedListingAds)|(?:RelatedAdsDetailQuery$)"
                                  options:0
@@ -280,8 +395,6 @@ static BOOL FFBIsDedicatedAdQueryName(NSString *name) {
 
 static BOOL FFBShouldFilterRCTResponseForQuery(NSString *name) {
     if (name.length == 0) return NO;
-    // Copre MarketplaceHomeFeed, MarketplaceSearch, MarketplaceCategory, MarketplacePDP,
-    // MarketplaceBrowse, Commerce e qualsiasi altra query GraphQL su RCTNetworking.
     return ([name hasPrefix:@"Marketplace"] ||
             [name containsString:@"Marketplace"] ||
             [name containsString:@"Commerce"] ||
@@ -289,7 +402,7 @@ static BOOL FFBShouldFilterRCTResponseForQuery(NSString *name) {
             [name containsString:@"Search"]);
 }
 
-static NSUInteger FFBStripMutableJSONInPlace(id obj, BOOL blockAds, BOOL hideSuggested, NSUInteger depth) {
+static NSUInteger FFBStripMutableJSONInPlace(id obj, const FFBFilterFlags &flags, NSUInteger depth, NSUInteger *outAdsCount) {
     if (!obj || depth > 24) return 0;
     NSUInteger removed = 0;
 
@@ -297,11 +410,13 @@ static NSUInteger FFBStripMutableJSONInPlace(id obj, BOOL blockAds, BOOL hideSug
         NSMutableArray *arr = (NSMutableArray *)obj;
         for (NSInteger i = (NSInteger)arr.count - 1; i >= 0; i--) {
             id item = arr[(NSUInteger)i];
-            if (FFBIsSponsoredJSONItem(item, blockAds, hideSuggested)) {
+            BOOL isAd = NO;
+            if (FFBShouldDropJSONItem(item, flags, &isAd)) {
                 [arr removeObjectAtIndex:(NSUInteger)i];
                 removed++;
+                if (isAd && outAdsCount) (*outAdsCount)++;
             } else {
-                removed += FFBStripMutableJSONInPlace(item, blockAds, hideSuggested, depth + 1);
+                removed += FFBStripMutableJSONInPlace(item, flags, depth + 1, outAdsCount);
             }
         }
     } else if ([obj isKindOfClass:NSMutableDictionary.class]) {
@@ -310,7 +425,7 @@ static NSUInteger FFBStripMutableJSONInPlace(id obj, BOOL blockAds, BOOL hideSug
         for (id k in keys) {
             id val = dict[k];
             if ([val isKindOfClass:NSMutableArray.class] || [val isKindOfClass:NSMutableDictionary.class]) {
-                removed += FFBStripMutableJSONInPlace(val, blockAds, hideSuggested, depth + 1);
+                removed += FFBStripMutableJSONInPlace(val, flags, depth + 1, outAdsCount);
             }
         }
     }
@@ -318,13 +433,15 @@ static NSUInteger FFBStripMutableJSONInPlace(id obj, BOOL blockAds, BOOL hideSug
 }
 
 static NSData *FFBFilterRCTResponseData(NSData *data) {
-    if (!data || data.length < 32 || data.length > 12 * 1024 * 1024) return data;
+    if (!data || data.length < 48 || data.length > 12 * 1024 * 1024) return data;
 
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled) return data;
-    BOOL blockAds = prefs.blockAllAds;
-    BOOL hideSuggested = prefs.hideSuggestedClutter;
-    if (!blockAds && !hideSuggested) return data;
+    FFBFilterFlags flags = FFBReadCurrentFilterFlags();
+    if (!flags.anyJSONActive()) return data;
+
+    // Fast-path byte-scan: se la pagina non contiene alcun token sponsorizzato/PYMK, restituisci subito i byte originali!
+    if (!FFBDataMayContainFilterableTokens(data, flags)) {
+        return data;
+    }
 
     NSString *body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
     if (!body || body.length == 0) return data;
@@ -337,6 +454,7 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
         NSArray<NSString *> *parts = [body componentsSeparatedByString:sep];
         NSMutableArray<NSString *> *outParts = [NSMutableArray arrayWithCapacity:parts.count];
         NSUInteger totalRemoved = 0;
+        NSUInteger totalAds = 0;
 
         for (NSString *part in parts) {
             NSString *trimmed = [part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
@@ -349,16 +467,19 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
                 gInsideInternalJSONPass = false;
                 return data;
             }
+            if (!FFBDataMayContainFilterableTokens(partData, flags)) {
+                [outParts addObject:part];
+                continue;
+            }
             id json = [NSJSONSerialization JSONObjectWithData:partData
                                                       options:NSJSONReadingMutableContainers
                                                         error:nil];
             if (!json) {
-                // Non è JSON puro (es. multipart non standard): lascia invariato per sicurezza
                 gInsideInternalJSONPass = false;
                 return data;
             }
 
-            NSUInteger removedHere = FFBStripMutableJSONInPlace(json, blockAds, hideSuggested, 0);
+            NSUInteger removedHere = FFBStripMutableJSONInPlace(json, flags, 0, &totalAds);
             if (removedHere == 0) {
                 [outParts addObject:part];
                 continue;
@@ -379,7 +500,9 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
         }
 
         if (totalRemoved > 0) {
-            gBlockedAdsCount.fetch_add(totalRemoved, std::memory_order_relaxed);
+            if (totalAds > 0) {
+                gBlockedAdsCount.fetch_add(totalAds, std::memory_order_relaxed);
+            }
             NSString *joined = [outParts componentsJoinedByString:sep];
             NSData *encoded = [joined dataUsingEncoding:NSUTF8StringEncoding];
             if (encoded.length > 0) {
@@ -395,16 +518,29 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
 }
 
 @interface FFBBlockingRCTHandler : NSObject
-+ (instancetype)shared;
+@property (nonatomic, assign) BOOL returnEmptyGraphQLJSON;
++ (instancetype)sharedAdBlocker;
++ (instancetype)sharedSilentSuccess;
 @end
 
 @implementation FFBBlockingRCTHandler
 
-+ (instancetype)shared {
++ (instancetype)sharedAdBlocker {
     static FFBBlockingRCTHandler *instance = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         instance = [[FFBBlockingRCTHandler alloc] init];
+        instance.returnEmptyGraphQLJSON = NO;
+    });
+    return instance;
+}
+
++ (instancetype)sharedSilentSuccess {
+    static FFBBlockingRCTHandler *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[FFBBlockingRCTHandler alloc] init];
+        instance.returnEmptyGraphQLJSON = YES;
     });
     return instance;
 }
@@ -414,7 +550,8 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
 }
 
 - (BOOL)canHandleRequest:(NSURLRequest *)request {
-    return FFBIsDedicatedAdQueryName(FFBRCTExtractFriendlyName(request));
+    return FFBIsDedicatedAdQueryName(FFBRCTExtractFriendlyName(request)) ||
+           FocusFBIsStorySeenNetworkRequest(request);
 }
 
 - (float)handlerPriority {
@@ -423,13 +560,32 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
 
 - (id)sendRequest:(NSURLRequest *)request withDelegate:(id<FFBRCTURLRequestDelegate>)delegate {
     id token = [NSUUID UUID];
-    NSError *err = [NSError errorWithDomain:NSURLErrorDomain
-                                       code:NSURLErrorNotConnectedToInternet
-                                   userInfo:@{NSLocalizedDescriptionKey: @"Blocked by FocusFB AdBlock"}];
-    // Completamento asincrono così RCTNetworkTask registra prima il token senza race condition
+    BOOL silentOK = self.returnEmptyGraphQLJSON;
+    NSURL *reqURL = request.URL ?: [NSURL URLWithString:@"https://graph.facebook.com/graphql"];
+
     dispatch_async(dispatch_get_main_queue(), ^{
-        if ([delegate respondsToSelector:@selector(URLRequest:didCompleteWithError:)]) {
-            [delegate URLRequest:token didCompleteWithError:err];
+        if (silentOK) {
+            NSData *emptyOK = [@"{\"data\":{},\"extensions\":{\"is_final\":true}}" dataUsingEncoding:NSUTF8StringEncoding];
+            if ([delegate respondsToSelector:@selector(URLRequest:didReceiveResponse:)]) {
+                NSHTTPURLResponse *resp = [[NSHTTPURLResponse alloc] initWithURL:reqURL
+                                                                      statusCode:200
+                                                                     HTTPVersion:@"HTTP/1.1"
+                                                                    headerFields:@{@"Content-Type": @"application/json"}];
+                [delegate URLRequest:token didReceiveResponse:resp];
+            }
+            if ([delegate respondsToSelector:@selector(URLRequest:didReceiveData:)]) {
+                [delegate URLRequest:token didReceiveData:emptyOK];
+            }
+            if ([delegate respondsToSelector:@selector(URLRequest:didCompleteWithError:)]) {
+                [delegate URLRequest:token didCompleteWithError:nil];
+            }
+        } else {
+            NSError *err = [NSError errorWithDomain:NSURLErrorDomain
+                                               code:NSURLErrorNotConnectedToInternet
+                                           userInfo:@{NSLocalizedDescriptionKey: @"Blocked by FocusFB"}];
+            if ([delegate respondsToSelector:@selector(URLRequest:didCompleteWithError:)]) {
+                [delegate URLRequest:token didCompleteWithError:err];
+            }
         }
     });
     return token;
@@ -523,14 +679,19 @@ static NSMutableSet *FFBLiveRCTDelegates(void) {
 static id FFBHook_RCTNetworking_handlerForRequest(id self, SEL _cmd, NSURLRequest *request) {
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
     if (prefs.enabled) {
+        if (FocusFBIsStorySeenNetworkRequest(request)) {
+            return [FFBBlockingRCTHandler sharedSilentSuccess];
+        }
+
         NSString *queryName = FFBRCTExtractFriendlyName(request);
         if (prefs.blockAllAds && FFBIsDedicatedAdQueryName(queryName)) {
             gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-            return [FFBBlockingRCTHandler shared];
+            return [FFBBlockingRCTHandler sharedAdBlocker];
         }
 
         id origHandler = gOrigRCTHandlerForReq ? gOrigRCTHandlerForReq(self, _cmd, request) : nil;
-        if (origHandler && (prefs.blockAllAds || prefs.hideSuggestedClutter) && FFBShouldFilterRCTResponseForQuery(queryName)) {
+        FFBFilterFlags flags = FFBReadCurrentFilterFlags();
+        if (origHandler && flags.anyJSONActive() && FFBShouldFilterRCTResponseForQuery(queryName)) {
             FFBFilteringRCTHandler *wrapper = [[FFBFilteringRCTHandler alloc] init];
             wrapper.innerHandler = origHandler;
             return wrapper;
@@ -542,7 +703,9 @@ static id FFBHook_RCTNetworking_handlerForRequest(id self, SEL _cmd, NSURLReques
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTORE 2: Pando & FBTree C++ GraphQL Model Layer (FBMemModelObject)
-// Rimuove gli annunci in News Feed, Gruppi, Storie, Reels e Video prima del dataSource
+// Rimuove Ads, PYMK ("Persone che potresti conoscere"), Carosello Reels,
+// Post Suggeriti e Barra Storie PRIMA che raggiungano la UICollectionView
+// (zero celle fantasma, zero scatti durante lo scroll!)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static BOOL FFBIsThreadsPromoModel(id model, Class cls) {
@@ -564,14 +727,6 @@ static BOOL FFBIsThreadsPromoModel(id model, Class cls) {
                 }
             } @catch (__unused NSException *e) {}
         }
-        @try {
-            id val = [model valueForKey:key];
-            if ([val isKindOfClass:NSString.class] &&
-                ([val isEqualToString:@"THREADS_IN_FEED_UNIT"] ||
-                 [val isEqualToString:@"THREADS_IN_STORY_UNIT_MID_CARD"])) {
-                return YES;
-            }
-        } @catch (__unused NSException *e) {}
     }
     return NO;
 }
@@ -620,19 +775,13 @@ static BOOL FFBIsMarketplaceModelSponsoredViaKVC(id model) {
 static BOOL FFBShouldFilterGraphQLModel(id model) {
     if (!model) return NO;
 
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled) return NO;
-
-    BOOL blockAds = prefs.blockAllAds;
-    BOOL hideSuggested = prefs.hideSuggestedClutter;
-    BOOL hideStoriesReels = prefs.hideStoriesAndInlineReels;
-
-    if (!blockAds && !hideSuggested && !hideStoriesReels) return NO;
+    FFBFilterFlags flags = FFBReadCurrentFilterFlags();
+    if (!flags.anyActive()) return NO;
 
     Class cls = object_getClass(model);
     NSString *clsName = NSStringFromClass(cls) ?: @"";
 
-    // Non filtrare l'oggetto figlio *SponsoredData* stesso, così il post padre mantiene [story sponsoredData] != nil
+    // Non filtrare il nodo figlio *SponsoredData* stesso, così il post padre mantiene [story sponsoredData] != nil
     if ([clsName containsString:@"SponsoredData"] || [clsName hasSuffix:@"AdData"]) {
         return NO;
     }
@@ -643,7 +792,7 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
         id rawCat = ((id (*)(id, SEL))objc_msgSend)(model, catSel);
         if ([rawCat isKindOfClass:NSString.class]) {
             NSString *cat = (NSString *)rawCat;
-            if (blockAds &&
+            if (flags.blockAds &&
                 ([cat isEqualToString:@"SPONSORED"] ||
                  [cat isEqualToString:@"AD"] ||
                  [cat isEqualToString:@"ADS"] ||
@@ -653,23 +802,64 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
                 gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
                 return YES;
             }
-            if (hideSuggested &&
-                ([cat isEqualToString:@"ENGAGEMENT"] ||
-                 [cat isEqualToString:@"ENGAGEMENT_QP"] ||
-                 [cat isEqualToString:@"PYMK"] ||
-                 [cat isEqualToString:@"PYMK_STORY"])) {
+            if (flags.hidePYMK &&
+                ([cat isEqualToString:@"PYMK"] ||
+                 [cat isEqualToString:@"PYMK_STORY"] ||
+                 [cat isEqualToString:@"FRIENDING"])) {
                 return YES;
             }
-            if (hideStoriesReels &&
+            if (flags.hideReelsCarousel &&
                 ([cat isEqualToString:@"FB_SHORTS"] ||
-                 [cat isEqualToString:@"MULTI_FB_STORIES_TRAY"])) {
+                 [cat isEqualToString:@"FB_SHORTS_FALLBACK"] ||
+                 [cat isEqualToString:@"SHORT_FORM_VIDEO"] ||
+                 [cat containsString:@"FB_SHORTS"])) {
+                return YES;
+            }
+            if (flags.hideSuggested &&
+                ([cat isEqualToString:@"ENGAGEMENT"] ||
+                 [cat isEqualToString:@"ENGAGEMENT_QP"] ||
+                 [cat isEqualToString:@"RECOMMENDATION"])) {
+                return YES;
+            }
+            if (flags.hideStoriesTray &&
+                ([cat isEqualToString:@"MULTI_FB_STORIES_TRAY"] ||
+                 [cat isEqualToString:@"STORIES_TRAY"])) {
                 return YES;
             }
         }
     }
 
-    // 2. Controllo `sponsoredData`, `isSponsored`, classi Ad e `storyBucketType`
-    if (blockAds) {
+    // 2. Controllo `storyBucketType` (Ads, PYMK e Suggeriti dentro la riga Storie!)
+    SEL bucketSel = @selector(storyBucketType);
+    if (FFBMethodReturnsObject(cls, bucketSel)) {
+        id bucket = ((id (*)(id, SEL))objc_msgSend)(model, bucketSel);
+        if ([bucket isKindOfClass:NSString.class]) {
+            NSString *bStr = (NSString *)bucket;
+            if (flags.blockAds &&
+                ([bStr isEqualToString:@"ADS"] ||
+                 [bStr isEqualToString:@"AD"] ||
+                 [bStr isEqualToString:@"SPONSORED"] ||
+                 [bStr isEqualToString:@"SPONSORED_STORY"] ||
+                 [bStr containsString:@"SPONSOR"])) {
+                gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
+                return YES;
+            }
+            if (flags.hidePYMK &&
+                ([bStr isEqualToString:@"PYMK_STORY"] ||
+                 [bStr isEqualToString:@"PYMK"] ||
+                 [bStr containsString:@"FRIEND_SUGGESTION"])) {
+                return YES;
+            }
+            if (flags.hideSuggested &&
+                ([bStr isEqualToString:@"SUGGESTED_STORY"] ||
+                 [bStr containsString:@"PAGE_SUGGESTION"])) {
+                return YES;
+            }
+        }
+    }
+
+    // 3. Controllo `sponsoredData`, `isSponsored` e classi Ad
+    if (flags.blockAds) {
         SEL sponsSel = @selector(sponsoredData);
         if (FFBMethodReturnsObject(cls, sponsSel)) {
             id sData = ((id (*)(id, SEL))objc_msgSend)(model, sponsSel);
@@ -695,25 +885,6 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
             return YES;
         }
 
-        SEL bucketSel = @selector(storyBucketType);
-        if (FFBMethodReturnsObject(cls, bucketSel)) {
-            id bucket = ((id (*)(id, SEL))objc_msgSend)(model, bucketSel);
-            if ([bucket isKindOfClass:NSString.class]) {
-                NSString *bStr = (NSString *)bucket;
-                if ([bStr isEqualToString:@"ADS"] ||
-                    [bStr isEqualToString:@"AD"] ||
-                    [bStr isEqualToString:@"SPONSORED"] ||
-                    [bStr isEqualToString:@"SPONSORED_STORY"] ||
-                    [bStr containsString:@"SPONSOR"]) {
-                    gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-                    return YES;
-                }
-                if (hideSuggested && [bStr isEqualToString:@"PYMK_STORY"]) {
-                    return YES;
-                }
-            }
-        }
-
         if ([clsName containsString:@"Marketplace"] ||
             [clsName containsString:@"GroupCommerce"] ||
             [clsName containsString:@"CommerceProduct"]) {
@@ -724,20 +895,24 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
         }
     }
 
-    // 3. Rimozione unità suggerite (Gruppi, Pagine, PYMK, Promo Threads)
-    if (hideSuggested) {
-        if ([clsName containsString:@"GroupsYouShouldJoin"] ||
-            [clsName containsString:@"PagesYouMayLike"] ||
-            [clsName containsString:@"PeopleYouMayKnow"]) {
+    // 4. Rimozione "Persone che potresti conoscere" (PYMK)
+    if (flags.hidePYMK && FFBIsPYMKTypenameString(clsName)) {
+        return YES;
+    }
+
+    // 5. Rimozione Carosello Reels nel Feed
+    if (flags.hideReelsCarousel && FFBIsReelsCarouselTypenameString(clsName)) {
+        return YES;
+    }
+
+    // 6. Rimozione Gruppi, Pagine consigliate, Storie singole suggerite e Promo Threads
+    if (flags.hideSuggested) {
+        if (FFBIsSuggestedTypenameString(clsName)) {
             return YES;
         }
         if ([clsName containsString:@"FeedUnit"] && FFBIsThreadsPromoModel(model, cls)) {
             return YES;
         }
-    }
-
-    if (hideStoriesReels && [clsName containsString:@"SingleBucketInlineViewer"]) {
-        return YES;
     }
 
     return NO;
@@ -759,7 +934,7 @@ static id FFBHook_initWithFBTree(id self, SEL _cmd, void *tree) {
 // MOTORE 3: NSJSONSerialization Pruner (Bloks / Relay Nativo fuori da RCTNetworking)
 // ─────────────────────────────────────────────────────────────────────────────
 
-static id FFBPruneAdsInJSONNode(id obj, BOOL mutableContainers, BOOL blockAds, BOOL hideSuggested, NSUInteger depth, BOOL *outChanged) {
+static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilterFlags &flags, NSUInteger depth, BOOL *outChanged) {
     if (!obj || depth > 20) return obj;
 
     if ([obj isKindOfClass:NSArray.class]) {
@@ -771,7 +946,8 @@ static id FFBPruneAdsInJSONNode(id obj, BOOL mutableContainers, BOOL blockAds, B
 
         for (NSUInteger i = 0; i < arr.count; i++) {
             id item = arr[i];
-            if (FFBIsSponsoredJSONItem(item, blockAds, hideSuggested)) {
+            BOOL isAd = NO;
+            if (FFBShouldDropJSONItem(item, flags, &isAd)) {
                 if (!localChanged) {
                     localChanged = YES;
                     cleaned = [NSMutableArray arrayWithCapacity:arr.count];
@@ -779,12 +955,14 @@ static id FFBPruneAdsInJSONNode(id obj, BOOL mutableContainers, BOOL blockAds, B
                         [cleaned addObject:arr[j]];
                     }
                 }
-                gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
+                if (isAd) {
+                    gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
+                }
                 continue;
             }
 
             BOOL childChanged = NO;
-            id newItem = FFBPruneAdsInJSONNode(item, mutableContainers, blockAds, hideSuggested, depth + 1, &childChanged);
+            id newItem = FFBPruneItemsInJSONNode(item, mutableContainers, flags, depth + 1, &childChanged);
             if (childChanged && !localChanged) {
                 localChanged = YES;
                 cleaned = [NSMutableArray arrayWithCapacity:arr.count];
@@ -817,7 +995,7 @@ static id FFBPruneAdsInJSONNode(id obj, BOOL mutableContainers, BOOL blockAds, B
                 continue;
             }
             BOOL childChanged = NO;
-            id newVal = FFBPruneAdsInJSONNode(val, mutableContainers, blockAds, hideSuggested, depth + 1, &childChanged);
+            id newVal = FFBPruneItemsInJSONNode(val, mutableContainers, flags, depth + 1, &childChanged);
             if (childChanged) {
                 if (!localChanged) {
                     localChanged = YES;
@@ -837,28 +1015,6 @@ static id FFBPruneAdsInJSONNode(id obj, BOOL mutableContainers, BOOL blockAds, B
     return obj;
 }
 
-static inline BOOL FFBBytesContainASCII(const uint8_t *buf, size_t bufLen, const char *pat, size_t patLen) {
-    const uint8_t *p = reinterpret_cast<const uint8_t *>(pat);
-    return std::search(buf, buf + bufLen, p, p + patLen) != (buf + bufLen);
-}
-
-static BOOL FFBDataMayContainAdsTokens(NSData *data) {
-    const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
-    size_t len = (size_t)data.length;
-    if (!bytes || len < 48) return NO;
-
-    if (FFBBytesContainASCII(bytes, len, "sponsored", 9)) return YES;
-    if (FFBBytesContainASCII(bytes, len, "SPONSORED", 9)) return YES;
-    if (FFBBytesContainASCII(bytes, len, "Sponsored", 9)) return YES;
-    if (FFBBytesContainASCII(bytes, len, "ad_data", 7))   return YES;
-    if (FFBBytesContainASCII(bytes, len, "\"ad_id\"", 7)) return YES;
-    if (FFBBytesContainASCII(bytes, len, "AdStory", 7))   return YES;
-    if (FFBBytesContainASCII(bytes, len, "AdsFeed", 7))   return YES;
-    if (FFBBytesContainASCII(bytes, len, "AdUnit", 6))    return YES;
-    if (FFBBytesContainASCII(bytes, len, "BannerAd", 8))  return YES;
-    return NO;
-}
-
 static id FFBHook_JSONObjectWithData(id self,
                                      SEL _cmd,
                                      NSData *data,
@@ -867,133 +1023,22 @@ static id FFBHook_JSONObjectWithData(id self,
     id parsed = gOrigJSONWithData ? gOrigJSONWithData(self, _cmd, data, opt, error) : nil;
     if (!parsed || !data || gInsideInternalJSONPass) return parsed;
 
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled) return parsed;
-    BOOL blockAds = prefs.blockAllAds;
-    BOOL hideSuggested = prefs.hideSuggestedClutter;
-    if (!blockAds && !hideSuggested) return parsed;
+    FFBFilterFlags flags = FFBReadCurrentFilterFlags();
+    if (!flags.anyJSONActive()) return parsed;
     if (data.length < 64 || data.length > 8 * 1024 * 1024) return parsed;
-    if (!FFBDataMayContainAdsTokens(data)) return parsed;
+    if (!FFBDataMayContainFilterableTokens(data, flags)) return parsed;
 
     @try {
         BOOL changed = NO;
         BOOL wantMutable = ((opt & NSJSONReadingMutableContainers) != 0);
-        return FFBPruneAdsInJSONNode(parsed, wantMutable, blockAds, hideSuggested, 0, &changed);
+        return FFBPruneItemsInJSONNode(parsed, wantMutable, flags, 0, &changed);
     } @catch (__unused NSException *e) {
         return parsed;
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MOTORE 4: Rete di Sicurezza UI su Celle già in Cache (ComponentKit / Bloks / RN)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static BOOL FFBTextIsStandaloneSponsoredBadge(NSString *raw) {
-    if (![raw isKindOfClass:NSString.class] || raw.length < 6 || raw.length > 160) return NO;
-    NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"\n\r•·|,"];
-    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
-
-    for (NSString *segment in [raw componentsSeparatedByCharactersInSet:sep]) {
-        NSString *t = [[segment stringByTrimmingCharactersInSet:ws] lowercaseString];
-        if (t.length < 6 || t.length > 40) continue;
-        if ([t isEqualToString:@"sponsorizzato"] ||
-            [t isEqualToString:@"sponsored"] ||
-            [t isEqualToString:@"sponsorizzato dal venditore"] ||
-            [t isEqualToString:@"sponsored by seller"] ||
-            [t isEqualToString:@"inserzione sponsorizzata"] ||
-            [t isEqualToString:@"annuncio sponsorizzato"] ||
-            [t isEqualToString:@"partnership pubblicitaria"] ||
-            [t isEqualToString:@"paid partnership"] ||
-            [t isEqualToString:@"sponsorisé"] ||
-            [t isEqualToString:@"publicidad"] ||
-            [t isEqualToString:@"gesponsert"]) {
-            return YES;
-        }
-    }
-    return NO;
-}
-
-static BOOL FFBSubtreeHasSponsoredDisclosure(UIView *view, NSUInteger depth) {
-    if (!view || depth > 7) return NO;
-
-    if ([view isKindOfClass:UILabel.class]) {
-        if (FFBTextIsStandaloneSponsoredBadge(((UILabel *)view).text)) return YES;
-    }
-    NSString *axLbl = view.accessibilityLabel;
-    if (axLbl.length > 0 && FFBTextIsStandaloneSponsoredBadge(axLbl)) {
-        return YES;
-    }
-    NSString *axId = view.accessibilityIdentifier;
-    if (axId.length > 0) {
-        NSString *lowerId = axId.lowercaseString;
-        if ([lowerId containsString:@"sponsored_label"] ||
-            [lowerId containsString:@"marketplace_ad"] ||
-            [lowerId isEqualToString:@"ad_badge"]) {
-            return YES;
-        }
-    }
-
-    for (UIView *sub in view.subviews) {
-        if (FFBSubtreeHasSponsoredDisclosure(sub, depth + 1)) return YES;
-    }
-    return NO;
-}
-
-static void FFBResetAdHiddenCellIfNeeded(UICollectionViewCell *cell) {
-    if ([objc_getAssociatedObject(cell, &kCellHiddenByAdBlockKey) boolValue]) {
-        cell.contentView.hidden = NO;
-        cell.alpha = 1.0;
-        cell.userInteractionEnabled = YES;
-        objc_setAssociatedObject(cell, &kCellHiddenByAdBlockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        objc_setAssociatedObject(cell, &kCellCountedByAdBlockKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
-}
-
-static void FFBHook_Cell_prepareForReuse(id self, SEL _cmd) {
-    if (gOrigCellPrepareReuse) gOrigCellPrepareReuse(self, _cmd);
-    FFBResetAdHiddenCellIfNeeded((UICollectionViewCell *)self);
-}
-
-static void FFBHook_Cell_layoutSubviews(id self, SEL _cmd) {
-    if (gOrigCellLayout) gOrigCellLayout(self, _cmd);
-    if (!NSThread.isMainThread) return;
-
-    UICollectionViewCell *cell = (UICollectionViewCell *)self;
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled || !prefs.blockAllAds) {
-        FFBResetAdHiddenCellIfNeeded(cell);
-        return;
-    }
-
-    UIView *parent = cell.superview;
-    if (!parent) return;
-    NSString *parentCls = NSStringFromClass(object_getClass(parent)) ?: @"";
-    NSString *cellCls = NSStringFromClass(object_getClass(cell)) ?: @"";
-    if (![parentCls hasPrefix:@"FB"] && ![parentCls hasPrefix:@"CK"] &&
-        ![parentCls hasPrefix:@"RCT"] && ![parentCls hasPrefix:@"BK"] &&
-        ![cellCls hasPrefix:@"FB"] && ![cellCls hasPrefix:@"CK"] &&
-        ![cellCls hasPrefix:@"RCT"] && ![cellCls hasPrefix:@"BK"]) {
-        return;
-    }
-
-    if (FFBSubtreeHasSponsoredDisclosure(cell.contentView, 0)) {
-        cell.contentView.hidden = YES;
-        cell.alpha = 0.0;
-        cell.userInteractionEnabled = NO;
-        objc_setAssociatedObject(cell, &kCellHiddenByAdBlockKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (![objc_getAssociatedObject(cell, &kCellCountedByAdBlockKey) boolValue]) {
-            objc_setAssociatedObject(cell, &kCellCountedByAdBlockKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-        }
-    } else {
-        FFBResetAdHiddenCellIfNeeded(cell);
-    }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Installazione Hook AdBlock (Immediata + Dyld Lazy-Loaded Framework Listener)
-// FBReactNativeProductsFramework (RCTNetworking) e FBSharedFramework (Pando)
-// vengono agganciati nell'istante esatto in cui dyld li carica in memoria!
+// Installazione Hook AdBlock & Feed Cleanup (Immediata + Dyld Lazy Listener)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void FFBInstallAvailableAdHooksNow(void) {
@@ -1037,18 +1082,6 @@ static void FFBInstallAvailableAdHooksNow(void) {
                                                       (IMP *)&gOrigJSONWithData);
         }
     }
-
-    if (!gInstalledCellHooks) {
-        BOOL ok1 = FFBInstallMethodHook(UICollectionViewCell.class,
-                                        @selector(layoutSubviews),
-                                        (IMP)FFBHook_Cell_layoutSubviews,
-                                        (IMP *)&gOrigCellLayout);
-        BOOL ok2 = FFBInstallMethodHook(UICollectionViewCell.class,
-                                        @selector(prepareForReuse),
-                                        (IMP)FFBHook_Cell_prepareForReuse,
-                                        (IMP *)&gOrigCellPrepareReuse);
-        gInstalledCellHooks = (ok1 && ok2);
-    }
 }
 
 static void FFBAdBlockDyldImageAdded(__unused const struct mach_header *mh, __unused intptr_t vmaddr_slide) {
@@ -1062,8 +1095,6 @@ void FocusFBInstallAdBlocker(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         FFBInstallAvailableAdHooksNow();
-        // Fondamentale: aggancia automaticamente FBReactNativeProductsFramework (RCTNetworking)
-        // non appena Marketplace viene caricato, anche minuti dopo l'avvio dell'app!
         _dyld_register_func_for_add_image(FFBAdBlockDyldImageAdded);
     });
 }

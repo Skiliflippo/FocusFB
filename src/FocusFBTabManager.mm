@@ -2,6 +2,8 @@
 #import "FocusFBPrefs.h"
 #import "FocusFBSettingsViewController.h"
 #import "FocusFBLockManager.h"
+#import "FocusFBStoriesManager.h"
+#import "FocusFBMediaDownloader.h"
 
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
@@ -27,6 +29,8 @@ static char kContextDelegateKey;
 static char kContextInteractionKey;
 static char kBarLongPressKey;
 static char kWindowTwoFingerKey;
+static char kCachedBarPassKey;
+static char kCachedVCBarsKey;
 
 typedef void (*FFBLayoutIMP)(id, SEL);
 typedef void (*FFBViewDidAppearIMP)(id, SEL, BOOL);
@@ -57,6 +61,7 @@ static BOOL gHooksInstalledVC               = NO;
 static BOOL gIsReflowingNavbar = NO;
 static BOOL gForceFullScreenSingleBar = NO;
 static BOOL gDidInitialLaunchRedirect = NO;
+static BOOL gLastKnownPrimaryTabIsMarketplace = YES;
 static CFTimeInterval gLastMarketplaceRedirectAttempt = 0;
 
 static NSHashTable<UIView *> *FFBHiddenBottomChromeViews(void) {
@@ -238,6 +243,62 @@ UIWindow *FocusFBActiveWindow(void) {
     return fallback;
 }
 
+static BOOL FFBMethodReturnsObjOnClass(Class cls, SEL sel) {
+    if (!cls || !sel) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    const char *enc = method_getTypeEncoding(m);
+    return (enc != NULL && enc[0] == '@');
+}
+
+// Scende nei custom container di Meta (FBTabBarViewController, FBTabBarAndContentViewController, ecc.)
+// trovando il childViewController realmente montato e visibile nel viewport dello schermo!
+static UIViewController *FFBBestVisibleChildOfContainer(UIViewController *vc, UIWindow *win) {
+    if (!vc) return nil;
+    Class cls = object_getClass(vc);
+
+    static NSArray<NSString *> *selNames = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        selNames = @[@"selectedViewController", @"currentViewController", @"activeViewController", @"_selectedViewController"];
+    });
+    for (NSString *name in selNames) {
+        SEL sel = NSSelectorFromString(name);
+        if (FFBMethodReturnsObjOnClass(cls, sel)) {
+            @try {
+                id child = ((id (*)(id, SEL))objc_msgSend)(vc, sel);
+                if ([child isKindOfClass:UIViewController.class] && child != vc) {
+                    return (UIViewController *)child;
+                }
+            } @catch (__unused NSException *e) {}
+        }
+    }
+
+    NSArray<UIViewController *> *children = vc.childViewControllers;
+    if (children.count == 0) return nil;
+
+    CGRect viewport = win ? win.bounds : UIScreen.mainScreen.bounds;
+    UIViewController *bestChild = nil;
+    CGFloat bestArea = 0.0;
+
+    for (UIViewController *child in [children reverseObjectEnumerator]) {
+        if (!child.isViewLoaded) continue;
+        UIView *v = child.view;
+        if (!v || v.hidden || v.alpha <= 0.01 || !v.window) continue;
+
+        CGRect rectInWin = [v convertRect:v.bounds toView:v.window];
+        CGRect inter = CGRectIntersection(rectInWin, viewport);
+        if (CGRectIsNull(inter) || inter.size.width < 80.0 || inter.size.height < 80.0) continue;
+
+        CGFloat area = inter.size.width * inter.size.height;
+        if (area > bestArea) {
+            bestArea = area;
+            bestChild = child;
+        }
+    }
+    return bestChild;
+}
+
 UIViewController *FocusFBTopMostViewController(void) {
     UIWindow *win = FocusFBActiveWindow();
     UIViewController *vc = win.rootViewController;
@@ -254,7 +315,9 @@ UIViewController *FocusFBTopMostViewController(void) {
             if (!sel || sel == vc) break;
             vc = sel;
         } else {
-            break;
+            UIViewController *visChild = FFBBestVisibleChildOfContainer(vc, win);
+            if (!visChild || visChild == vc) break;
+            vc = visChild;
         }
     }
     return vc;
@@ -559,43 +622,95 @@ static void FFBSyncFloatingGearButton(UIWindow *window) {
     [window addSubview:blur];
 }
 
-// Espande ricorsivamente i container principali (fino alla UIScrollView di Marketplace)
-// eliminando il ritaglio inferiore di ~83pt lasciato da FBTabBarViewController quando la barra è nascosta.
+@interface FFBCachedNavbarPass : NSObject
+@property (nonatomic, assign) uint64_t prefsGeneration;
+@property (nonatomic, assign) BOOL forceMPOnly;
+@property (nonatomic, assign) NSInteger barWidthRounded;
+@property (nonatomic, assign) NSUInteger directSubviewCount;
+@property (nonatomic, assign) BOOL singleBarHidden;
+@end
+
+@implementation FFBCachedNavbarPass
+@end
+
+// Clamping pre-super sul container principale (zero oscillazioni 769pt <-> 852pt e zero saltelli scroll!)
+static void FFBFullScreenContainer_setFrame(UIView *self, SEL _cmd, CGRect frame) {
+    if (gForceFullScreenSingleBar) {
+        UIView *superview = self.superview;
+        if (superview) {
+            CGFloat parentH = CGRectGetHeight(superview.bounds);
+            CGFloat parentW = CGRectGetWidth(superview.bounds);
+            if (parentH > 320.0 &&
+                CGRectGetMinY(frame) <= 24.0 &&
+                fabs(CGRectGetWidth(frame) - parentW) <= 6.0) {
+                CGFloat missingBottom = parentH - CGRectGetMaxY(frame);
+                if (missingBottom >= 34.0 && missingBottom <= 145.0) {
+                    frame.size.height = parentH - CGRectGetMinY(frame);
+                }
+            }
+        }
+    }
+    struct objc_super sup = { self, class_getSuperclass(object_getClass(self)) };
+    ((void (*)(struct objc_super *, SEL, CGRect))objc_msgSendSuper)(&sup, _cmd, frame);
+}
+
+static void FFBEnsureFullScreenContainerSubclass(UIView *node) {
+    if (!node || [node isKindOfClass:UIScrollView.class]) return;
+    Class origCls = object_getClass(node);
+    NSString *origName = NSStringFromClass(origCls) ?: @"";
+    if (origName.length == 0 ||
+        [origName hasPrefix:@"FFBFullScreenContainer_"] ||
+        [origName hasPrefix:@"NSKVONotifying_"] ||
+        FFBIsFacebookNavbarView(node) ||
+        [node isKindOfClass:UITabBar.class]) {
+        return;
+    }
+
+    NSString *subName = [@"FFBFullScreenContainer_" stringByAppendingString:origName];
+    Class subCls = objc_getClass(subName.UTF8String);
+    if (!subCls) {
+        subCls = objc_allocateClassPair(origCls, subName.UTF8String, 0);
+        if (subCls) {
+            class_addMethod(subCls,
+                            @selector(setFrame:),
+                            (IMP)FFBFullScreenContainer_setFrame,
+                            "v@:{CGRect={CGPoint=dd}{CGSize=dd}}");
+            objc_registerClassPair(subCls);
+        }
+    }
+    if (subCls) {
+        object_setClass(node, subCls);
+    }
+}
+
+// Espande i container strutturali fino alla UIScrollView SENZA MAI toccare contentInset durante lo scroll!
 static void FFBExpandClippedContentTree(UIView *node,
                                         CGFloat targetBottomHeight,
                                         CGFloat screenH,
-                                        CGFloat safeBottom,
+                                        __unused CGFloat safeBottom,
                                         NSUInteger depth) {
-    if (!node || depth > 7) return;
+    if (!node || depth > 5) return;
     if (node.tag == kFloatingBtnTag || node.tag == kTimerPillTag ||
         node.tag == kFeedShieldTag || node.tag == kReelsShieldTag) {
+        return;
+    }
+
+    // NON mutare mai UIScrollView / RCTScrollView: toccare contentInset o frame durante lo scroll
+    // causa saltelli di contentOffset su Marketplace!
+    if ([node isKindOfClass:UIScrollView.class]) {
         return;
     }
 
     CGFloat minY = CGRectGetMinY(node.frame);
     CGFloat curH = CGRectGetHeight(node.frame);
     if (minY <= 24.0 && curH > screenH * 0.48) {
+        FFBEnsureFullScreenContainerSubclass(node);
         CGFloat desiredH = targetBottomHeight - minY;
-        if (curH < desiredH - 0.5) {
+        if (curH < desiredH - 0.5 && (desiredH - curH) <= 145.0) {
             CGRect f = node.frame;
             f.size.height = desiredH;
             node.frame = f;
         }
-    }
-
-    if ([node isKindOfClass:UIScrollView.class]) {
-        UIScrollView *sv = (UIScrollView *)node;
-        // Rimuove eventuale padding inferiore eccessivo riservato alla barra nascosta
-        if (sv.contentInset.bottom > safeBottom + 38.0) {
-            UIEdgeInsets ins = sv.contentInset;
-            ins.bottom = safeBottom + 6.0;
-            sv.contentInset = ins;
-
-            UIEdgeInsets ind = sv.verticalScrollIndicatorInsets;
-            ind.bottom = safeBottom;
-            sv.verticalScrollIndicatorInsets = ind;
-        }
-        return; // Non scendere nelle celle della scrollView
     }
 
     CGFloat nextTargetH = CGRectGetHeight(node.bounds);
@@ -705,6 +820,28 @@ static void FFBSetEntireBottomBarHidden(UIView *bar, BOOL hideEntirely) {
 static void FFBApplyFilterToTabBar(UIView *bar) {
     if (!bar || gIsReflowingNavbar || !NSThread.isMainThread) return;
 
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    BOOL forceMPOnly = [FocusFBLockManager shared].shouldForceMarketplaceOnlyNow;
+    uint64_t currentGen = prefs.prefsGeneration;
+    NSInteger currentW = (NSInteger)llround(CGRectGetWidth(bar.bounds));
+    NSUInteger subCount = bar.subviews.count;
+
+    // Fast-path 120Hz: quando la barra è già nascosta e né preferenze né larghezza sono cambiate,
+    // non scansionare MAI subview o accessibilityLabel ad ogni frame di scroll!
+    FFBCachedNavbarPass *cachedPass = objc_getAssociatedObject(bar, &kCachedBarPassKey);
+    if (cachedPass &&
+        cachedPass.prefsGeneration == currentGen &&
+        cachedPass.forceMPOnly == forceMPOnly &&
+        cachedPass.barWidthRounded == currentW &&
+        cachedPass.directSubviewCount == subCount) {
+        if (cachedPass.singleBarHidden) {
+            if (!bar.hidden) bar.hidden = YES;
+            if (bar.alpha > 0.01) bar.alpha = 0.0;
+            bar.userInteractionEnabled = NO;
+            return;
+        }
+    }
+
     gIsReflowingNavbar = YES;
     @try {
         FFBAttachLongPressToBar(bar);
@@ -715,8 +852,6 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             gIsReflowingNavbar = NO;
             return;
         }
-
-        FocusFBPrefs *prefs = [FocusFBPrefs shared];
 
         // Salva indice canonico e frame nativo di ciascun tab prima del reflow
         for (NSUInteger idx = 0; idx < items.count; idx++) {
@@ -739,7 +874,6 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             return NSOrderedSame;
         }];
 
-        BOOL forceMPOnly = [FocusFBLockManager shared].shouldForceMarketplaceOnlyNow;
         NSMutableArray<UIView *> *allowedItems = [NSMutableArray array];
         for (NSUInteger idx = 0; idx < items.count; idx++) {
             UIView *item = items[idx];
@@ -764,6 +898,16 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             }
         }
 
+        void (^saveNavbarCache)(BOOL) = ^(BOOL singleHidden) {
+            FFBCachedNavbarPass *pass = [[FFBCachedNavbarPass alloc] init];
+            pass.prefsGeneration = currentGen;
+            pass.forceMPOnly = forceMPOnly;
+            pass.barWidthRounded = (NSInteger)llround(CGRectGetWidth(bar.bounds));
+            pass.directSubviewCount = bar.subviews.count;
+            pass.singleBarHidden = singleHidden;
+            objc_setAssociatedObject(bar, &kCachedBarPassKey, pass, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        };
+
         // Se FocusFB è spento, ripristina tutti gli elementi e l'intera barra
         if (!prefs.enabled) {
             FFBSetEntireBottomBarHidden(bar, NO);
@@ -774,6 +918,7 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
                 NSValue *origVal = objc_getAssociatedObject(item, &kOrigFrameKey);
                 if (origVal) item.frame = origVal.CGRectValue;
             }
+            saveNavbarCache(NO);
             gIsReflowingNavbar = NO;
             return;
         }
@@ -787,10 +932,12 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
         // Opzione: nascondi COMPLETAMENTE l'intera barra bianca inferiore ed espandi a tutto schermo quando resta <= 1 tab
         if (allowedItems.count <= 1 && prefs.hideSingleTabBar) {
             FFBSetEntireBottomBarHidden(bar, YES);
+            saveNavbarCache(YES);
             gIsReflowingNavbar = NO;
             return;
         } else {
             FFBSetEntireBottomBarHidden(bar, NO);
+            saveNavbarCache(NO);
         }
 
         NSSet<UIView *> *allowedSet = [NSSet setWithArray:allowedItems];
@@ -930,16 +1077,76 @@ static BOOL FFBIsAuthOrLoginScreenVisible(void) {
 static BOOL FFBIsHomeFeedControllerName(NSString *clsName);
 static BOOL FFBIsReelsOrWatchControllerName(NSString *clsName);
 
+static NSString *FFBReadSurfaceModuleName(UIViewController *vc) {
+    if (!vc) return nil;
+    static NSArray<NSString *> *propNames = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        propNames = @[@"moduleName", @"surfaceName", @"analyticsModule", @"fb_analyticsModule"];
+    });
+
+    Class vcCls = object_getClass(vc);
+    for (NSString *p in propNames) {
+        SEL sel = NSSelectorFromString(p);
+        if (FFBMethodReturnsObjOnClass(vcCls, sel)) {
+            @try {
+                id val = ((id (*)(id, SEL))objc_msgSend)(vc, sel);
+                if ([val isKindOfClass:NSString.class] && ((NSString *)val).length > 0) {
+                    return (NSString *)val;
+                }
+            } @catch (__unused NSException *e) {}
+        }
+    }
+    if (vc.isViewLoaded && vc.view) {
+        Class vCls = object_getClass(vc.view);
+        for (NSString *p in propNames) {
+            SEL sel = NSSelectorFromString(p);
+            if (FFBMethodReturnsObjOnClass(vCls, sel)) {
+                @try {
+                    id val = ((id (*)(id, SEL))objc_msgSend)(vc.view, sel);
+                    if ([val isKindOfClass:NSString.class] && ((NSString *)val).length > 0) {
+                        return (NSString *)val;
+                    }
+                } @catch (__unused NSException *e) {}
+            }
+        }
+    }
+    return nil;
+}
+
 static BOOL FFBControllerLooksLikeMarketplaceContext(UIViewController *vc) {
     if (!vc) return NO;
     NSString *cls = NSStringFromClass(vc.class).lowercaseString;
-    NSString *title = (vc.navigationItem.title ?: vc.title ?: @"").lowercaseString;
+    NSString *title = (vc.navigationItem.title ?: vc.title ?: vc.tabBarItem.title ?: @"").lowercaseString;
     if ([cls containsString:@"marketplace"] ||
         [cls containsString:@"b2c"] ||
         [cls containsString:@"commerce"] ||
-        [cls containsString:@"fbreact"] ||
-        [cls containsString:@"rct"] ||
+        [cls containsString:@"buysell"] ||
         [title containsString:@"marketplace"]) {
+        return YES;
+    }
+
+    NSString *mod = FFBReadSurfaceModuleName(vc).lowercaseString;
+    if (mod.length > 0) {
+        if ([mod containsString:@"marketplace"] ||
+            [mod containsString:@"commerce"] ||
+            [mod containsString:@"product_details"] ||
+            [mod containsString:@"buy_sell"]) {
+            return YES;
+        }
+        if ([mod containsString:@"newsfeed"] ||
+            [mod containsString:@"friending"] ||
+            [mod containsString:@"notifications"] ||
+            [mod containsString:@"bookmarks"] ||
+            [mod containsString:@"groups"] ||
+            [mod containsString:@"timeline"] ||
+            [mod containsString:@"shorts"] ||
+            [mod containsString:@"reels"]) {
+            return NO;
+        }
+    }
+
+    if ([cls containsString:@"fbreact"] || [cls containsString:@"rct"]) {
         return YES;
     }
     return NO;
@@ -955,15 +1162,90 @@ static BOOL FFBControllerLooksExplicitlyNonMarketplaceRoot(UIViewController *vc)
     if ([lower containsString:@"marketplace"] || [lower containsString:@"commerce"]) {
         return NO;
     }
-    return ([lower containsString:@"notificationsview"] ||
-            [lower containsString:@"notificationtab"] ||
-            [lower containsString:@"bookmarksview"] ||
-            [lower containsString:@"menutab"] ||
-            [lower containsString:@"friending"] ||
-            [lower containsString:@"friendcenter"] ||
-            [lower containsString:@"groupstab"] ||
-            [lower containsString:@"groupslanding"] ||
-            [lower containsString:@"gaming"]);
+    if ([lower containsString:@"snacks"] ||
+        [lower containsString:@"storyviewer"] ||
+        [lower containsString:@"storiesviewer"] ||
+        [lower containsString:@"notificationsview"] ||
+        [lower containsString:@"notificationtab"] ||
+        [lower containsString:@"bookmarksview"] ||
+        [lower containsString:@"menutab"] ||
+        [lower containsString:@"friending"] ||
+        [lower containsString:@"friendcenter"] ||
+        [lower containsString:@"groupstab"] ||
+        [lower containsString:@"groupslanding"] ||
+        [lower containsString:@"profileviewcontroller"] ||
+        [lower containsString:@"timelineviewcontroller"] ||
+        [lower containsString:@"gaming"]) {
+        return YES;
+    }
+
+    NSString *mod = FFBReadSurfaceModuleName(vc).lowercaseString;
+    if (mod.length > 0 &&
+        ([mod containsString:@"newsfeed"] ||
+         [mod containsString:@"friending"] ||
+         [mod containsString:@"notifications"] ||
+         [mod containsString:@"bookmarks"] ||
+         [mod containsString:@"groups_tab"] ||
+         [mod containsString:@"timeline"] ||
+         [mod containsString:@"shorts"] ||
+         [mod containsString:@"reels"] ||
+         [mod containsString:@"stories"])) {
+        return YES;
+    }
+    return NO;
+}
+
+// Restituisce +1 se la catena appartiene a Marketplace, -1 se appartiene a Feed/Reels/Social, 0 se neutro (es. modal foto/sheet)
+static NSInteger FFBClassifyControllerChainForMarketplace(UIViewController *leafVC) {
+    UIViewController *cur = leafVC;
+    NSUInteger guard = 0;
+
+    while (cur && guard++ < 24) {
+        if ([cur isKindOfClass:FocusFBSettingsViewController.class] ||
+            [cur isKindOfClass:UIAlertController.class]) {
+            cur = cur.presentingViewController ?: cur.parentViewController;
+            continue;
+        }
+
+        NSString *clsName = NSStringFromClass(cur.class);
+        if (FFBIsHomeFeedControllerName(clsName) || FFBIsReelsOrWatchControllerName(clsName)) {
+            return -1;
+        }
+
+        if (cur.navigationController && cur.navigationController.viewControllers.count > 0) {
+            UIViewController *rootStackVC = cur.navigationController.viewControllers.firstObject;
+            if (FFBControllerLooksLikeMarketplaceContext(rootStackVC)) {
+                return 1;
+            }
+            if (FFBControllerLooksExplicitlyNonMarketplaceRoot(rootStackVC)) {
+                return -1;
+            }
+            for (UIViewController *stackVC in [cur.navigationController.viewControllers reverseObjectEnumerator]) {
+                if (FFBControllerLooksLikeMarketplaceContext(stackVC)) {
+                    return 1;
+                }
+                if (FFBControllerLooksExplicitlyNonMarketplaceRoot(stackVC)) {
+                    return -1;
+                }
+            }
+        }
+
+        if (FFBControllerLooksLikeMarketplaceContext(cur)) {
+            return 1;
+        }
+        if (FFBControllerLooksExplicitlyNonMarketplaceRoot(cur)) {
+            return -1;
+        }
+
+        if (cur.parentViewController) {
+            cur = cur.parentViewController;
+        } else if (cur.presentingViewController) {
+            cur = cur.presentingViewController;
+        } else {
+            break;
+        }
+    }
+    return 0;
 }
 
 BOOL FocusFBIsUserCurrentlyInMarketplace(void) {
@@ -975,15 +1257,54 @@ BOOL FocusFBIsUserCurrentlyInMarketplace(void) {
         return YES;
     }
 
-    UIViewController *top = FocusFBTopMostViewController();
-    if (top) {
-        NSString *topCls = NSStringFromClass(top.class);
-        if (FFBIsHomeFeedControllerName(topCls) || FFBIsReelsOrWatchControllerName(topCls)) {
-            return NO;
-        }
+    // Viewer Storie a tutto schermo -> superficie distraente (NON Marketplace)
+    if (FocusFBIsStoryViewerVisibleNow()) {
+        gLastKnownPrimaryTabIsMarketplace = NO;
+        return NO;
     }
 
-    // 1. Segnale primario: controlla quale tab è selezionato sulla barra di Facebook
+    // 1. Ispeziona il ViewController visibile (ora scende anche dentro FBTabBarViewController / FBTabBarAndContentViewController!)
+    UIViewController *top = FocusFBTopMostViewController();
+    NSInteger topVerdict = FFBClassifyControllerChainForMarketplace(top);
+    if (topVerdict > 0) {
+        gLastKnownPrimaryTabIsMarketplace = YES;
+        return YES;
+    }
+    if (topVerdict < 0) {
+        gLastKnownPrimaryTabIsMarketplace = NO;
+        return NO;
+    }
+
+    // 2. Se il topVC è neutro (es. FBPhotoViewController su una foto di un annuncio, ActionSheet, Impostazioni),
+    //    ispeziona la tab primaria attiva sotto eventuali modal!
+    UIViewController *primaryLeaf = win.rootViewController;
+    NSUInteger guard = 0;
+    while (primaryLeaf && guard++ < 16) {
+        if ([primaryLeaf isKindOfClass:UINavigationController.class]) {
+            UIViewController *vis = ((UINavigationController *)primaryLeaf).topViewController;
+            if (!vis || vis == primaryLeaf) break;
+            primaryLeaf = vis;
+        } else if ([primaryLeaf isKindOfClass:UITabBarController.class]) {
+            UIViewController *sel = ((UITabBarController *)primaryLeaf).selectedViewController;
+            if (!sel || sel == primaryLeaf) break;
+            primaryLeaf = sel;
+        } else {
+            UIViewController *visChild = FFBBestVisibleChildOfContainer(primaryLeaf, win);
+            if (!visChild || visChild == primaryLeaf) break;
+            primaryLeaf = visChild;
+        }
+    }
+    NSInteger primaryVerdict = FFBClassifyControllerChainForMarketplace(primaryLeaf);
+    if (primaryVerdict > 0) {
+        gLastKnownPrimaryTabIsMarketplace = YES;
+        return YES;
+    }
+    if (primaryVerdict < 0) {
+        gLastKnownPrimaryTabIsMarketplace = NO;
+        return NO;
+    }
+
+    // 3. Controlla quale tab risulta selezionato sulla barra di Facebook
     NSMutableArray<UIView *> *bars = [NSMutableArray array];
     FFBFindAllTabBarsInView(win.rootViewController.viewIfLoaded, 0, bars);
     for (UIView *bar in bars) {
@@ -993,8 +1314,14 @@ BOOL FocusFBIsUserCurrentlyInMarketplace(void) {
                 NSString *ident = selItem.accessibilityIdentifier ?: @"";
                 NSString *lbl = selItem.title ?: selItem.accessibilityLabel ?: @"";
                 FocusFBTabType selType = [FocusFBPrefs classifyTabWithIdentifier:ident label:lbl];
-                if (selType == FocusFBTabMarketplace) return YES;
-                if (selType != FocusFBTabUnknown) return NO;
+                if (selType == FocusFBTabMarketplace) {
+                    gLastKnownPrimaryTabIsMarketplace = YES;
+                    return YES;
+                }
+                if (selType != FocusFBTabUnknown) {
+                    gLastKnownPrimaryTabIsMarketplace = NO;
+                    return NO;
+                }
             }
         }
         NSMutableArray<UIView *> *items = [NSMutableArray array];
@@ -1004,34 +1331,30 @@ BOOL FocusFBIsUserCurrentlyInMarketplace(void) {
             if (FFBIsItemMarkedSelected(item, 0)) {
                 FocusFBTabType type = FocusFBTabUnknown;
                 FFBDescribeTabItem(item, idx, NULL, NULL, NULL, &type);
-                if (type == FocusFBTabMarketplace) return YES;
-                if (type != FocusFBTabUnknown) return NO;
-            }
-        }
-    }
-
-    // 2. Segnale secondario: stack del navigation controller attivo
-    if (top) {
-        if (top.navigationController && top.navigationController.viewControllers.count > 0) {
-            UIViewController *rootStackVC = top.navigationController.viewControllers.firstObject;
-            if (FFBControllerLooksExplicitlyNonMarketplaceRoot(rootStackVC)) {
-                return NO;
-            }
-            for (UIViewController *stackVC in top.navigationController.viewControllers) {
-                if (FFBControllerLooksLikeMarketplaceContext(stackVC)) {
+                if (type == FocusFBTabMarketplace) {
+                    gLastKnownPrimaryTabIsMarketplace = YES;
                     return YES;
+                }
+                if (type != FocusFBTabUnknown) {
+                    gLastKnownPrimaryTabIsMarketplace = NO;
+                    return NO;
                 }
             }
         }
-        if (FFBControllerLooksExplicitlyNonMarketplaceRoot(top)) {
-            return NO;
-        }
-        if (FFBControllerLooksLikeMarketplaceContext(top)) {
-            return YES;
-        }
     }
 
-    return NO;
+    // 4. Se l'utente è in modalità Solo Marketplace (nessuna tab distraente attiva) e nessuna schermata
+    //    distraente è aperta, mantieni sempre Marketplace sbloccato!
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    if (prefs.enabled && prefs.showMarketplaceTab &&
+        !prefs.showHomeTab && !prefs.showReelsTab &&
+        !prefs.showFriendsTab && !prefs.showGroupsTab &&
+        gDidInitialLaunchRedirect) {
+        gLastKnownPrimaryTabIsMarketplace = YES;
+        return YES;
+    }
+
+    return gLastKnownPrimaryTabIsMarketplace;
 }
 
 void FocusFBForceSwitchToMarketplaceNow(void) {
@@ -1372,8 +1695,8 @@ static void FFBApplyControllerProtection(UIViewController *vc) {
         [existingReelsShield removeFromSuperview];
     }
 
-    // 3. Storie e caroselli Reels inline
-    if (prefs.enabled && prefs.hideStoriesAndInlineReels && [clsName hasPrefix:@"FB"]) {
+    // 3. Storie e caroselli Reels inline (solo sul Feed Home, mai su Marketplace!)
+    if (prefs.enabled && (prefs.hideStoriesTray || prefs.hideReelsCarousel) && FFBIsHomeFeedControllerName(clsName)) {
         FFBHideInlineStoriesAndReelsViews(v, 0);
     }
 }
@@ -1434,13 +1757,29 @@ static void FFBHook_LegacyItem_layoutSubviews(id self, SEL _cmd) {
     FFBAttachContextMenuToTabItem((UIView *)self);
 }
 
+static NSArray<UIView *> *FFBCachedOrDiscoveredBarsForVC(UIViewController *vc, BOOL forceRescan) {
+    if (!vc.isViewLoaded || !vc.view) return @[];
+    NSHashTable<UIView *> *table = objc_getAssociatedObject(vc, &kCachedVCBarsKey);
+    if (!forceRescan && table && table.allObjects.count > 0) {
+        return table.allObjects;
+    }
+    NSMutableArray<UIView *> *bars = [NSMutableArray array];
+    FFBFindAllTabBarsInView(vc.view, 0, bars);
+    if (bars.count > 0) {
+        NSHashTable<UIView *> *weakSet = [NSHashTable weakObjectsHashTable];
+        for (UIView *b in bars) {
+            [weakSet addObject:b];
+        }
+        objc_setAssociatedObject(vc, &kCachedVCBarsKey, weakSet, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return bars;
+}
+
 static void FFBHook_TabBarVC_viewDidLayoutSubviews(id self, SEL _cmd) {
     if (gOrigTabBarVCLayout) gOrigTabBarVCLayout(self, _cmd);
     UIViewController *vc = (UIViewController *)self;
     if (!vc.isViewLoaded || !vc.view) return;
-    NSMutableArray<UIView *> *bars = [NSMutableArray array];
-    FFBFindAllTabBarsInView(vc.view, 0, bars);
-    for (UIView *bar in bars) {
+    for (UIView *bar in FFBCachedOrDiscoveredBarsForVC(vc, NO)) {
         FFBApplyFilterToTabBar(bar);
     }
 }
@@ -1455,9 +1794,7 @@ static void FFBHook_TabAndContentVC_viewDidLayoutSubviews(id self, SEL _cmd) {
             gOrigSetOffsetFrac(vc, offSel, 1.0, 0);
         }
     }
-    NSMutableArray<UIView *> *bars = [NSMutableArray array];
-    FFBFindAllTabBarsInView(vc.view, 0, bars);
-    for (UIView *bar in bars) {
+    for (UIView *bar in FFBCachedOrDiscoveredBarsForVC(vc, NO)) {
         FFBApplyFilterToTabBar(bar);
     }
 }
@@ -1481,9 +1818,11 @@ static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     FFBInstallDynamicHooksAvailableNow();
 
     if ([clsName hasPrefix:@"FB"] || [clsName hasPrefix:@"META"] ||
-        [clsName hasPrefix:@"MDS"] || [clsName hasPrefix:@"CDS"]) {
+        [clsName hasPrefix:@"MDS"] || [clsName hasPrefix:@"CDS"] ||
+        [clsName hasPrefix:@"RCT"]) {
         FFBApplyControllerProtection(vc);
         [[FocusFBLockManager shared] refreshEnforcementUI];
+        FocusFBMediaDownloaderSyncUI();
 
         if (FFBClassInheritsName(vc.class, kTabControllerName)) {
             FocusFBRefreshUIImmediately();
@@ -1635,11 +1974,13 @@ void FocusFBRefreshUIImmediately(void) {
             NSMutableArray<UIView *> *bars = [NSMutableArray array];
             FFBFindAllTabBarsInView(win.rootViewController.viewIfLoaded, 0, bars);
             for (UIView *bar in bars) {
+                objc_setAssociatedObject(bar, &kCachedBarPassKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 FFBApplyFilterToTabBar(bar);
                 [bar setNeedsLayout];
             }
         }
         FFBReevaluateVisibleControllers();
+        FocusFBMediaDownloaderSyncUI();
     });
 }
 

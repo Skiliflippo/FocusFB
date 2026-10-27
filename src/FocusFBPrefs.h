@@ -35,6 +35,9 @@ typedef NS_ENUM(NSInteger, FocusFBOverrideMode) {
 
 + (instancetype)shared;
 
+/// Contatore monotono incrementato a ogni modifica delle preferenze (per fast-path O(1) durante lo scroll)
+@property (nonatomic, readonly) uint64_t prefsGeneration;
+
 // Master switch & Onboarding
 @property (nonatomic, assign) BOOL enabled;
 @property (nonatomic, assign) BOOL hasSeenWelcome;
@@ -51,13 +54,25 @@ typedef NS_ENUM(NSInteger, FocusFBOverrideMode) {
 @property (nonatomic, assign) BOOL showMenuTab;
 @property (nonatomic, assign) BOOL hideUnknownTabs;
 
-// Protezioni Anti-Distrazione, AdBlock & Layout
+// Pulizia Feed e Pubblicità (stile Glow / Wolf)
 @property (nonatomic, assign) BOOL blockAllAds;
+@property (nonatomic, assign) BOOL hidePeopleYouMayKnow;
+@property (nonatomic, assign) BOOL hideReelsCarousel;
 @property (nonatomic, assign) BOOL hideSuggestedClutter;
+@property (nonatomic, assign) BOOL hideStoriesTray;
+
+// Download Media (Video, Reels, Foto e Storie nel Rullino)
+@property (nonatomic, assign) BOOL enableMediaDownload;
+@property (nonatomic, assign) BOOL showMediaDownloadButton;
+
+// Storie in Incognito & Controllo Avanzamento
+@property (nonatomic, assign) BOOL storiesIncognitoMode;
+@property (nonatomic, assign) BOOL storiesDisableAutoAdvance;
+
+// Protezioni Anti-Distrazione & Layout
 @property (nonatomic, assign) BOOL startOnMarketplace;
 @property (nonatomic, assign) BOOL shieldHomeFeed;
 @property (nonatomic, assign) BOOL blockReelsEverywhere;
-@property (nonatomic, assign) BOOL hideStoriesAndInlineReels;
 @property (nonatomic, assign) BOOL reflowVisibleTabs;
 @property (nonatomic, assign) BOOL hideSingleTabBar;
 

@@ -1,33 +1,45 @@
 #import "FocusFBPrefs.h"
+#include <atomic>
 
 NSString * const FocusFBPreferencesDidChangeNotification = @"com.focusfb.preferencesDidChange";
 
-static NSString * const kKeyEnabled                 = @"FocusFB_Enabled";
-static NSString * const kKeyHasSeenWelcome          = @"FocusFB_HasSeenWelcome";
-static NSString * const kKeyLanguageCode            = @"FocusFB_LanguageCode";
+static NSString * const kKeyEnabled                   = @"FocusFB_Enabled";
+static NSString * const kKeyHasSeenWelcome            = @"FocusFB_HasSeenWelcome";
+static NSString * const kKeyLanguageCode              = @"FocusFB_LanguageCode";
 
-static NSString * const kKeyShowHome                = @"FocusFB_ShowTab_Home";
-static NSString * const kKeyShowReels               = @"FocusFB_ShowTab_Reels";
-static NSString * const kKeyShowMarketplace         = @"FocusFB_ShowTab_Marketplace";
-static NSString * const kKeyShowFriends             = @"FocusFB_ShowTab_Friends";
-static NSString * const kKeyShowGroups              = @"FocusFB_ShowTab_Groups";
-static NSString * const kKeyShowNotifications       = @"FocusFB_ShowTab_Notifications";
-static NSString * const kKeyShowProfile             = @"FocusFB_ShowTab_Profile";
-static NSString * const kKeyShowMenu                = @"FocusFB_ShowTab_Menu";
-static NSString * const kKeyHideUnknown             = @"FocusFB_HideUnknownTabs";
+static NSString * const kKeyShowHome                  = @"FocusFB_ShowTab_Home";
+static NSString * const kKeyShowReels                 = @"FocusFB_ShowTab_Reels";
+static NSString * const kKeyShowMarketplace           = @"FocusFB_ShowTab_Marketplace";
+static NSString * const kKeyShowFriends               = @"FocusFB_ShowTab_Friends";
+static NSString * const kKeyShowGroups                = @"FocusFB_ShowTab_Groups";
+static NSString * const kKeyShowNotifications         = @"FocusFB_ShowTab_Notifications";
+static NSString * const kKeyShowProfile               = @"FocusFB_ShowTab_Profile";
+static NSString * const kKeyShowMenu                  = @"FocusFB_ShowTab_Menu";
+static NSString * const kKeyHideUnknown               = @"FocusFB_HideUnknownTabs";
 
-static NSString * const kKeyBlockAllAds             = @"FocusFB_BlockAllAds";
-static NSString * const kKeyHideSuggestedClutter    = @"FocusFB_HideSuggestedClutter";
-static NSString * const kKeyStartOnMarketplace      = @"FocusFB_StartOnMarketplace";
-static NSString * const kKeyShieldHomeFeed          = @"FocusFB_ShieldHomeFeed";
-static NSString * const kKeyBlockReelsEverywhere    = @"FocusFB_BlockReelsEverywhere";
-static NSString * const kKeyHideStoriesAndReels     = @"FocusFB_HideStoriesAndInlineReels";
-static NSString * const kKeyReflowVisibleTabs       = @"FocusFB_ReflowVisibleTabs";
-static NSString * const kKeyHideSingleTabBar        = @"FocusFB_HideSingleTabBar";
+static NSString * const kKeyBlockAllAds               = @"FocusFB_BlockAllAds";
+static NSString * const kKeyHidePeopleYouMayKnow      = @"FocusFB_HidePeopleYouMayKnow";
+static NSString * const kKeyHideReelsCarousel         = @"FocusFB_HideReelsCarousel";
+static NSString * const kKeyHideSuggestedClutter      = @"FocusFB_HideSuggestedClutter";
+static NSString * const kKeyHideStoriesTray           = @"FocusFB_HideStoriesTray";
 
-static NSString * const kKeyTwoFingerLongPress      = @"FocusFB_TwoFingerLongPress";
-static NSString * const kKeyShowFloatingGear        = @"FocusFB_ShowFloatingGear";
-static NSString * const kKeyCustomOverrides         = @"FocusFB_CustomTabOverrides";
+static NSString * const kKeyEnableMediaDownload       = @"FocusFB_EnableMediaDownload";
+static NSString * const kKeyShowMediaDownloadButton   = @"FocusFB_ShowMediaDownloadButton";
+
+static NSString * const kKeyStoriesIncognitoMode      = @"FocusFB_StoriesIncognitoMode";
+static NSString * const kKeyStoriesDisableAutoAdvance = @"FocusFB_StoriesDisableAutoAdvance";
+
+static NSString * const kKeyStartOnMarketplace        = @"FocusFB_StartOnMarketplace";
+static NSString * const kKeyShieldHomeFeed            = @"FocusFB_ShieldHomeFeed";
+static NSString * const kKeyBlockReelsEverywhere      = @"FocusFB_BlockReelsEverywhere";
+static NSString * const kKeyReflowVisibleTabs         = @"FocusFB_ReflowVisibleTabs";
+static NSString * const kKeyHideSingleTabBar          = @"FocusFB_HideSingleTabBar";
+
+static NSString * const kKeyTwoFingerLongPress        = @"FocusFB_TwoFingerLongPress";
+static NSString * const kKeyShowFloatingGear          = @"FocusFB_ShowFloatingGear";
+static NSString * const kKeyCustomOverrides           = @"FocusFB_CustomTabOverrides";
+
+static std::atomic<uint64_t> gPrefsGenCounter{1};
 
 @implementation FocusFBDiscoveredTab
 @end
@@ -45,8 +57,10 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
 
             // Sezioni
             @"Sec.Master": @"Generale",
-            @"Sec.AdBlock": @"Pubblicità",
-            @"Sec.AdBlockFooter": @"Rimuove inserzioni sponsorizzate in Marketplace, Feed e Storie.",
+            @"Sec.AdBlock": @"Pulizia Feed e pubblicità",
+            @"Sec.AdBlockFooter": @"Rimuove annunci sponsorizzati, carosello Reels, suggerimenti di amicizia e contenuti consigliati.",
+            @"Sec.MediaPrivacy": @"Download e Storie in incognito",
+            @"Sec.MediaPrivacyFooter": @"Tieni premuto su foto, video, Reels o Storie (oppure usa il pulsante salva) per scaricarli nel Rullino.",
             @"Sec.Presets": @"Configurazioni rapide",
             @"Sec.Tabs": @"Schede visibili",
             @"Sec.TabsFooter": @"Scegli quali schede tenere nella barra in basso.",
@@ -63,11 +77,40 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Master.EnableDesc": @"Disattiva per tornare temporaneamente a Facebook normale.",
             @"Lang.Switch": @"Lingua",
 
-            // AdBlock
-            @"AdBlock.EnableAll": @"Blocca inserzioni",
-            @"AdBlock.EnableAllDesc": @"Nasconde annunci sponsorizzati in Marketplace, ricerca e Feed.",
-            @"AdBlock.HideSuggested": @"Nascondi post suggeriti",
-            @"AdBlock.HideSuggestedDesc": @"Rimuove pagine consigliate e \"Persone che potresti conoscere\".",
+            // Pulizia Feed e AdBlock
+            @"AdBlock.EnableAll": @"Blocca inserzioni sponsorizzate",
+            @"AdBlock.EnableAllDesc": @"Rimuove annunci in Marketplace, ricerca, Feed e Storie.",
+            @"AdBlock.HidePYMK": @"Rimuovi \"Persone che potresti conoscere\"",
+            @"AdBlock.HidePYMKDesc": @"Elimina i riquadri di amicizie suggerite nel Feed e nelle Storie.",
+            @"AdBlock.HideReelsCarousel": @"Nascondi carosello Reels",
+            @"AdBlock.HideReelsCarouselDesc": @"Rimuove la striscia dei Reels consigliati dentro il Feed.",
+            @"AdBlock.HideSuggested": @"Nascondi post e pagine suggerite",
+            @"AdBlock.HideSuggestedDesc": @"Rimuove gruppi consigliati, post \"Suggeriti per te\" e Threads.",
+            @"AdBlock.HideStoriesTray": @"Nascondi barra Storie",
+            @"AdBlock.HideStoriesTrayDesc": @"Nasconde la riga delle Storie in cima al Feed.",
+
+            // Download & Storie in incognito
+            @"Media.EnableDownload": @"Download foto, video, Reels e Storie",
+            @"Media.EnableDownloadDesc": @"Tieni premuto su un contenuto multimediale per salvarlo nel Rullino.",
+            @"Media.ShowButton": @"Pulsante salva su Reels e Storie",
+            @"Media.ShowButtonDesc": @"Mostra un pulsante rapido quando apri un Reel, un video o una Storia.",
+            @"Stories.Incognito": @"Storie in incognito",
+            @"Stories.IncognitoDesc": @"Guarda le Storie degli amici senza comparire nella lista visualizzazioni.",
+            @"Stories.NoAutoAdvance": @"Ferma avanzamento automatico Storie",
+            @"Stories.NoAutoAdvanceDesc": @"Impedisce il passaggio automatico alla Storia o persona successiva.",
+
+            // Stringhe UI Download Media
+            @"DL.SheetTitle": @"Salva contenuto",
+            @"DL.SaveVideoHD": @"Salva video nel Rullino (HD)",
+            @"DL.SaveVideoSD": @"Salva video nel Rullino (SD)",
+            @"DL.SaveVideo": @"Salva video nel Rullino",
+            @"DL.SavePhoto": @"Salva foto nel Rullino",
+            @"DL.Share": @"Condividi...",
+            @"DL.Downloading": @"Download in corso...",
+            @"DL.SavedVideo": @"Video salvato nel Rullino",
+            @"DL.SavedPhoto": @"Foto salvata nel Rullino",
+            @"DL.Failed": @"Impossibile scaricare questo contenuto",
+            @"DL.NotFound": @"Avvia il video per un istante e riprova",
 
             // Presets
             @"Preset.MarketplaceOnly": @"Solo Marketplace",
@@ -75,7 +118,7 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Preset.SellerMode": @"Marketplace e Notifiche",
             @"Preset.SellerModeDesc": @"Tiene Marketplace, Notifiche e Menu per gestire annunci e risposte.",
             @"Preset.ShowAll": @"Mostra tutte le schede",
-            @"Preset.ShowAllDesc": @"Ripristina tutte le schede originali di Facebook.",
+            @"Preset.ShowAllDesc": @"Ripristina tutte le schede (mantenendo AdBlock, Download e Incognito).",
             @"Preset.AppliedToast": @"Impostazione applicata",
 
             // Tab names
@@ -104,10 +147,8 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Shield.StartMarketplaceDesc": @"All'avvio apre direttamente Marketplace invece della Home.",
             @"Shield.HomeFeed": @"Oscura il Feed Home",
             @"Shield.HomeFeedDesc": @"Copre i post della Home quando la scheda Home è disattivata.",
-            @"Shield.BlockReels": @"Blocca i Reels",
-            @"Shield.BlockReelsDesc": @"Impedisce l'apertura dei video Reels anche dai link.",
-            @"Shield.HideStories": @"Nascondi le Storie",
-            @"Shield.HideStoriesDesc": @"Rimuove la barra delle Storie in alto nel Feed.",
+            @"Shield.BlockReels": @"Blocca apertura Reels",
+            @"Shield.BlockReelsDesc": @"Impedisce l'apertura del player Reels anche dai link.",
             @"Shield.ReflowTabs": @"Centra le schede visibili",
             @"Shield.ReflowTabsDesc": @"Allinea al centro le icone rimaste nella barra inferiore.",
             @"Shield.HideSingleBar": @"Nascondi la barra con una sola scheda",
@@ -116,7 +157,7 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             // Shortcuts
             @"Short.TwoFinger": @"Tieni premuto con 2 dita",
             @"Short.TwoFingerDesc": @"Apre queste impostazioni tenendo 2 dita sullo schermo.",
-            @"Short.FloatingGear": @"Pulsante rapido a schermo",
+            @"Short.FloatingGear": @"Pulsante impostazioni a schermo",
             @"Short.FloatingGearDesc": @"Mostra una piccola icona ingranaggio sul bordo dello schermo.",
 
             // Overrides
@@ -143,15 +184,15 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
 
             // Welcome
             @"Welcome.Title": @"FocusFB è attivo",
-            @"Welcome.Body": @"Di base è visibile solo Marketplace, senza Feed né Reels.\n\nPer cambiare le schede o impostare limiti di tempo:\n• Tieni premuto con 2 dita in qualsiasi punto\n• Oppure tieni premuto sulla barra in basso",
+            @"Welcome.Body": @"Di base è visibile solo Marketplace, senza pubblicità né Reels.\n\nPer cambiare schede, scaricare media o attivare il blocco Foqos:\n• Tieni premuto con 2 dita in qualsiasi punto\n• Oppure tieni premuto sulla barra in basso",
             @"Welcome.Start": @"Continua",
             @"Welcome.Customize": @"Impostazioni",
 
-            // Foqos Strict Lock & Time Limits
-            @"Sec.FoqosLock": @"Blocco con chiave fisica (Foqos)",
-            @"Sec.FoqosLockFooter": @"Associa un codice QR, un codice a barre o un tag NFC che tieni lontano da te. Quando il blocco è attivo, per modificare queste impostazioni o sbloccare il tempo scaduto serve scansionare la chiave.",
+            // Foqos Strict Lock & Time Limits (SOLO Feed / Reels / Social, Marketplace sempre libero)
+            @"Sec.FoqosLock": @"Blocco Feed e Reels (Foqos)",
+            @"Sec.FoqosLockFooter": @"Limita il tempo speso su Feed, Reels e schede social usando un codice QR, un codice a barre o un tag NFC fisico. Marketplace resta sempre libero.",
             @"Lock.BannerLockedTitle": @"Blocco attivo",
-            @"Lock.BannerLockedSub": @"Scansiona la chiave fisica per modificare le impostazioni.",
+            @"Lock.BannerLockedSub": @"Marketplace è libero. Scansiona la chiave fisica per modificare le impostazioni.",
             @"Lock.BannerUnlockedTitle": @"Impostazioni sbloccate",
             @"Lock.BannerUnlockedSub": @"Il blocco tornerà attivo appena chiudi questa schermata.",
             @"Lock.ScanToEditBtn": @"Sblocca con chiave fisica",
@@ -163,21 +204,15 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Lock.GenerateSecretQRDesc": @"Crea un codice QR casuale da stampare o salvare altrove.",
             @"Lock.RegisterNFC": @"Associa tag NFC",
             @"Lock.RegisterNFCDesc": @"Avvicina una tessera o adesivo NFC all'iPhone.",
-            @"Lock.ScopeRow": @"Cosa bloccare",
-            @"Lock.ScopeExceptMPBadge": @"Tranne Marketplace",
-            @"Lock.ScopeEntireAppBadge": @"Tutta l'app",
-            @"Lock.ScopeExceptMPTitle": @"Tutto tranne Marketplace",
-            @"Lock.ScopeEntireAppTitle": @"Tutta l'app Facebook",
-            @"Lock.ScopeExceptMPDesc": @"Marketplace resta sempre libero; il timer vale solo per il Feed e le altre schede.",
-            @"Lock.ScopeEntireAppDesc": @"Il timer vale su tutta l'app, incluso Marketplace.",
-            @"Lock.SessionLimit": @"Tempo per sessione",
-            @"Lock.SessionLimitDesc": @"Durata massima di utilizzo continuo.",
+            @"Lock.ScopeExceptMPBadge": @"Feed e Reels",
+            @"Lock.SessionLimit": @"Tempo per sessione (Feed/Reels)",
+            @"Lock.SessionLimitDesc": @"Durata massima continua fuori da Marketplace.",
             @"Lock.Cooldown": @"Pausa tra le sessioni",
             @"Lock.CooldownDesc": @"Attesa richiesta prima della sessione successiva.",
-            @"Lock.DailyLimit": @"Limite giornaliero",
-            @"Lock.DailyLimitDesc": @"Tempo totale consentito in un giorno.",
+            @"Lock.DailyLimit": @"Limite giornaliero (Feed/Reels)",
+            @"Lock.DailyLimitDesc": @"Tempo totale consentito in un giorno fuori da Marketplace.",
             @"Lock.ShowTimerPill": @"Mostra tempo rimasto in alto",
-            @"Lock.ShowTimerPillDesc": @"Mostra il conto alla rovescia durante l'uso.",
+            @"Lock.ShowTimerPillDesc": @"Mostra il conto alla rovescia mentre usi Feed o altre schede.",
             @"Lock.AlwaysBlockedBadge": @"0 min",
             @"Lock.AlwaysBlockedOption": @"Sempre bloccato (0 min, solo con chiave)",
             @"Lock.EmergencyRow": @"Sblocco di emergenza",
@@ -192,32 +227,23 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Lock.EmergencyDisableWarnBody": @"Se disattivi questa opzione e perdi la chiave fisica, non potrai più sbloccare FocusFB dall'app.",
             @"Lock.EmergencyDisableConfirm": @"Disattiva",
             @"Lock.StrictToggleOn": @"Attiva blocco",
-            @"Lock.StrictToggleOnDesc": @"Protegge subito limiti e impostazioni con la chiave fisica.",
+            @"Lock.StrictToggleOnDesc": @"Blocca Feed, Reels e impostazioni con la chiave fisica (Marketplace resta libero).",
             @"Lock.StrictToggleOff": @"Disattiva blocco",
             @"Lock.StrictToggleOffDesc": @"Rimuove la protezione della chiave fisica.",
             @"Lock.Off": @"Spento",
             @"Lock.NeedKeyAlertTitle": @"Nessuna chiave associata",
             @"Lock.NeedKeyAlertBody": @"Prima di attivare il blocco, associa un codice QR, un codice a barre o un tag NFC.",
             @"Lock.LockedToast": @"Impostazioni bloccate: scansiona la chiave in alto",
-            @"Lock.WallSessionTitle": @"Tempo scaduto",
-            @"Lock.WallDailyTitle": @"Limite giornaliero raggiunto",
-            @"Lock.WallSessionBody": @"Hai terminato il tempo della sessione. Attendi la fine della pausa o usa la chiave fisica.",
-            @"Lock.WallDailyBody": @"Hai raggiunto il limite giornaliero impostato. Riprenderà dopo mezzanotte.",
-            @"Lock.WallExtraSessionTitle": @"Tempo scaduto",
+            @"Lock.WallExtraSessionTitle": @"Tempo Feed scaduto",
             @"Lock.WallExtraDailyTitle": @"Limite giornaliero raggiunto",
-            @"Lock.WallExtraAlwaysTitle": @"Sezione bloccata",
-            @"Lock.WallExtraBody": @"Il tempo per il Feed e le altre schede è terminato. Marketplace resta sempre utilizzabile.",
-            @"Lock.WallExtraAlwaysBody": @"Questa sezione è bloccata. Puoi usare liberamente Marketplace oppure scansionare la chiave per 5 minuti.",
-            @"Lock.WallUnlockBtn": @"Sblocca con chiave",
+            @"Lock.WallExtraAlwaysTitle": @"Feed e Reels bloccati",
+            @"Lock.WallExtraBody": @"Il tempo per Feed e schede social è terminato. Marketplace resta sempre libero.",
+            @"Lock.WallExtraAlwaysBody": @"Feed e Reels sono protetti dalla chiave fisica. Puoi tornare subito a Marketplace oppure sbloccare 5 minuti con la chiave.",
             @"Lock.WallResumeBtn": @"Sblocca con chiave (+5 min)",
             @"Lock.WallSettingsBtn": @"Sblocca impostazioni",
-            @"Lock.WallGoMarketplaceBtn": @"Vai a Marketplace",
+            @"Lock.WallGoMarketplaceBtn": @"Torna a Marketplace",
             @"Lock.WallRemainingWait": @"Disponibile tra",
             @"Lock.WallUsedToday": @"Usato oggi",
-            @"Lock.EmergencyMenuTitle": @"Chiave verificata",
-            @"Lock.EmergencyPlus5": @"+5 minuti",
-            @"Lock.EmergencyResetToday": @"Azzera tempo di oggi",
-            @"Lock.EmergencyOpenSettings": @"Apri impostazioni",
             @"Lock.ScanStep1": @"Inquadra il codice QR o a barre",
             @"Lock.ScanStep2": @"Inquadra di nuovo lo stesso codice per confermare",
             @"Lock.ScanUnlockPrompt": @"Inquadra la chiave registrata per sbloccare",
@@ -252,8 +278,10 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"OpenMarketplaceNow": @"Open Marketplace",
 
             @"Sec.Master": @"General",
-            @"Sec.AdBlock": @"Ads",
-            @"Sec.AdBlockFooter": @"Removes sponsored listings and ads in Marketplace, Feed, and Stories.",
+            @"Sec.AdBlock": @"Feed cleanup & ads",
+            @"Sec.AdBlockFooter": @"Removes sponsored ads, Reels carousels, friend suggestions, and recommended posts.",
+            @"Sec.MediaPrivacy": @"Media downloads & incognito Stories",
+            @"Sec.MediaPrivacyFooter": @"Long-press any photo, video, Reel, or Story (or tap the save button) to save directly to Photos.",
             @"Sec.Presets": @"Quick modes",
             @"Sec.Tabs": @"Visible tabs",
             @"Sec.TabsFooter": @"Choose which tabs stay on the bottom bar.",
@@ -269,17 +297,44 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Master.EnableDesc": @"Turn off to temporarily use standard Facebook.",
             @"Lang.Switch": @"Language",
 
-            @"AdBlock.EnableAll": @"Block ads",
-            @"AdBlock.EnableAllDesc": @"Hides sponsored listings and ads in Marketplace, search, and Feed.",
-            @"AdBlock.HideSuggested": @"Hide suggested posts",
-            @"AdBlock.HideSuggestedDesc": @"Removes suggested pages and People You May Know.",
+            @"AdBlock.EnableAll": @"Block sponsored ads",
+            @"AdBlock.EnableAllDesc": @"Removes ads across Marketplace, search, Feed, and Stories.",
+            @"AdBlock.HidePYMK": @"Remove \"People You May Know\"",
+            @"AdBlock.HidePYMKDesc": @"Hides friend suggestion boxes in Feed and Stories.",
+            @"AdBlock.HideReelsCarousel": @"Hide Reels carousel",
+            @"AdBlock.HideReelsCarouselDesc": @"Removes inline Reels shelves from the Feed.",
+            @"AdBlock.HideSuggested": @"Hide suggested posts & pages",
+            @"AdBlock.HideSuggestedDesc": @"Removes suggested groups, recommended posts, and Threads promos.",
+            @"AdBlock.HideStoriesTray": @"Hide Stories bar",
+            @"AdBlock.HideStoriesTrayDesc": @"Hides the Stories row at the top of the Feed.",
+
+            @"Media.EnableDownload": @"Download photos, videos, Reels & Stories",
+            @"Media.EnableDownloadDesc": @"Long-press any media item to save it directly to Photos.",
+            @"Media.ShowButton": @"Quick save button on Reels & Stories",
+            @"Media.ShowButtonDesc": @"Shows a clean save icon inside Reels, fullscreen videos, and Stories.",
+            @"Stories.Incognito": @"Incognito Stories",
+            @"Stories.IncognitoDesc": @"Watch friends' Stories without sending a viewed receipt.",
+            @"Stories.NoAutoAdvance": @"Stop Story auto-advance",
+            @"Stories.NoAutoAdvanceDesc": @"Prevents Stories from automatically advancing to the next person.",
+
+            @"DL.SheetTitle": @"Save media",
+            @"DL.SaveVideoHD": @"Save Video to Photos (HD)",
+            @"DL.SaveVideoSD": @"Save Video to Photos (SD)",
+            @"DL.SaveVideo": @"Save Video to Photos",
+            @"DL.SavePhoto": @"Save Photo to Photos",
+            @"DL.Share": @"Share...",
+            @"DL.Downloading": @"Downloading...",
+            @"DL.SavedVideo": @"Video saved to Photos",
+            @"DL.SavedPhoto": @"Photo saved to Photos",
+            @"DL.Failed": @"Could not download this media",
+            @"DL.NotFound": @"Play the video briefly and try again",
 
             @"Preset.MarketplaceOnly": @"Marketplace only",
             @"Preset.MarketplaceOnlyDesc": @"Keeps only full-screen Marketplace and blocks Feed and Reels.",
             @"Preset.SellerMode": @"Marketplace & Notifications",
             @"Preset.SellerModeDesc": @"Keeps Marketplace, Notifications, and Menu for managing listings.",
             @"Preset.ShowAll": @"Show all tabs",
-            @"Preset.ShowAllDesc": @"Restores all original Facebook tabs.",
+            @"Preset.ShowAllDesc": @"Restores all tabs while keeping AdBlock, Downloads, and Incognito active.",
             @"Preset.AppliedToast": @"Mode applied",
 
             @"Tab.Marketplace": @"Marketplace",
@@ -306,10 +361,8 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Shield.StartMarketplaceDesc": @"Skips Home at launch and opens Marketplace directly.",
             @"Shield.HomeFeed": @"Cover Home Feed",
             @"Shield.HomeFeedDesc": @"Covers Home posts when the Home tab is turned off.",
-            @"Shield.BlockReels": @"Block Reels",
+            @"Shield.BlockReels": @"Block Reels player",
             @"Shield.BlockReelsDesc": @"Prevents Reels from opening, including from shared links.",
-            @"Shield.HideStories": @"Hide Stories",
-            @"Shield.HideStoriesDesc": @"Removes the Stories bar at the top of the Feed.",
             @"Shield.ReflowTabs": @"Center visible tabs",
             @"Shield.ReflowTabsDesc": @"Centers remaining tab icons on the bottom bar.",
             @"Shield.HideSingleBar": @"Hide bottom bar when single tab",
@@ -317,8 +370,8 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
 
             @"Short.TwoFinger": @"2-finger hold",
             @"Short.TwoFingerDesc": @"Hold 2 fingers on screen to open these settings.",
-            @"Short.FloatingGear": @"On-screen gear button",
-            @"Short.FloatingGearDesc": @"Shows a small draggable button on the screen edge.",
+            @"Short.FloatingGear": @"On-screen settings button",
+            @"Short.FloatingGearDesc": @"Shows a small draggable gear button on the screen edge.",
 
             @"Override.Auto": @"Automatic",
             @"Override.Show": @"Always show",
@@ -340,15 +393,15 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Menu.SoloToggleOff": @"Show all tabs",
 
             @"Welcome.Title": @"FocusFB is active",
-            @"Welcome.Body": @"Only Marketplace is shown by default, with Feed and Reels turned off.\n\nTo customize tabs or set time limits:\n• Hold 2 fingers anywhere on screen\n• Or long-press the bottom bar",
+            @"Welcome.Body": @"Only Marketplace is shown by default, with ads and Reels removed.\n\nTo customize tabs, download media, or enable Foqos lock:\n• Hold 2 fingers anywhere on screen\n• Or long-press the bottom bar",
             @"Welcome.Start": @"Continue",
             @"Welcome.Customize": @"Settings",
 
-            // Foqos Strict Lock & Time Limits
-            @"Sec.FoqosLock": @"Physical key lock (Foqos)",
-            @"Sec.FoqosLockFooter": @"Pair a QR code, barcode, or NFC tag you keep out of reach. While locked, changing settings or unlocking expired time requires scanning your key.",
+            // Foqos Strict Lock & Time Limits (Feed / Reels / Social ONLY, Marketplace always free)
+            @"Sec.FoqosLock": @"Feed & Reels lock (Foqos)",
+            @"Sec.FoqosLockFooter": @"Limit time spent on Feed, Reels, and social tabs using a physical QR code, barcode, or NFC tag. Marketplace stays open at all times.",
             @"Lock.BannerLockedTitle": @"Lock active",
-            @"Lock.BannerLockedSub": @"Scan your physical key to edit settings.",
+            @"Lock.BannerLockedSub": @"Marketplace is open. Scan your physical key to edit settings.",
             @"Lock.BannerUnlockedTitle": @"Settings unlocked",
             @"Lock.BannerUnlockedSub": @"Lock will resume when you close this screen.",
             @"Lock.ScanToEditBtn": @"Unlock with physical key",
@@ -360,21 +413,15 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Lock.GenerateSecretQRDesc": @"Generate a random QR code to print or save elsewhere.",
             @"Lock.RegisterNFC": @"Pair NFC tag",
             @"Lock.RegisterNFCDesc": @"Hold an NFC card or sticker near your iPhone.",
-            @"Lock.ScopeRow": @"What to lock",
-            @"Lock.ScopeExceptMPBadge": @"Except Marketplace",
-            @"Lock.ScopeEntireAppBadge": @"Entire app",
-            @"Lock.ScopeExceptMPTitle": @"Everything except Marketplace",
-            @"Lock.ScopeEntireAppTitle": @"Entire Facebook app",
-            @"Lock.ScopeExceptMPDesc": @"Marketplace stays open at all times; timer applies only to Feed and other tabs.",
-            @"Lock.ScopeEntireAppDesc": @"Timer applies to the entire app, including Marketplace.",
-            @"Lock.SessionLimit": @"Session time",
-            @"Lock.SessionLimitDesc": @"Maximum continuous usage per session.",
+            @"Lock.ScopeExceptMPBadge": @"Feed & Reels",
+            @"Lock.SessionLimit": @"Session time (Feed/Reels)",
+            @"Lock.SessionLimitDesc": @"Maximum continuous usage outside Marketplace.",
             @"Lock.Cooldown": @"Break between sessions",
             @"Lock.CooldownDesc": @"Waiting time before starting a new session.",
-            @"Lock.DailyLimit": @"Daily limit",
-            @"Lock.DailyLimitDesc": @"Total time allowed per day.",
+            @"Lock.DailyLimit": @"Daily limit (Feed/Reels)",
+            @"Lock.DailyLimitDesc": @"Total time allowed per day outside Marketplace.",
             @"Lock.ShowTimerPill": @"Show remaining time at top",
-            @"Lock.ShowTimerPillDesc": @"Displays a small countdown while active.",
+            @"Lock.ShowTimerPillDesc": @"Displays a countdown while using Feed or social tabs.",
             @"Lock.AlwaysBlockedBadge": @"0 min",
             @"Lock.AlwaysBlockedOption": @"Always locked (0 min, key only)",
             @"Lock.EmergencyRow": @"Emergency unlock",
@@ -389,32 +436,23 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Lock.EmergencyDisableWarnBody": @"If you disable this option and lose your physical key, you will not be able to unlock FocusFB from inside the app.",
             @"Lock.EmergencyDisableConfirm": @"Turn off",
             @"Lock.StrictToggleOn": @"Turn on lock",
-            @"Lock.StrictToggleOnDesc": @"Locks settings and time limits behind your physical key.",
+            @"Lock.StrictToggleOnDesc": @"Protects Feed, Reels, and settings with your key (Marketplace stays open).",
             @"Lock.StrictToggleOff": @"Turn off lock",
             @"Lock.StrictToggleOffDesc": @"Removes physical key protection.",
             @"Lock.Off": @"Off",
             @"Lock.NeedKeyAlertTitle": @"No key paired",
             @"Lock.NeedKeyAlertBody": @"Pair a QR code, barcode, or NFC tag before turning on the lock.",
             @"Lock.LockedToast": @"Settings locked: scan your key at the top",
-            @"Lock.WallSessionTitle": @"Time is up",
-            @"Lock.WallDailyTitle": @"Daily limit reached",
-            @"Lock.WallSessionBody": @"Your session has ended. Wait for the break to finish or scan your key.",
-            @"Lock.WallDailyBody": @"You have reached today's time limit. Resets at midnight.",
-            @"Lock.WallExtraSessionTitle": @"Time is up",
+            @"Lock.WallExtraSessionTitle": @"Feed time is up",
             @"Lock.WallExtraDailyTitle": @"Daily limit reached",
-            @"Lock.WallExtraAlwaysTitle": @"Section locked",
-            @"Lock.WallExtraBody": @"Your time for Feed and other tabs is up. Marketplace remains open.",
-            @"Lock.WallExtraAlwaysBody": @"This section is locked. You can use Marketplace freely or scan your key for 5 minutes.",
-            @"Lock.WallUnlockBtn": @"Unlock with key",
+            @"Lock.WallExtraAlwaysTitle": @"Feed & Reels locked",
+            @"Lock.WallExtraBody": @"Your time for Feed and social tabs is up. Marketplace remains open.",
+            @"Lock.WallExtraAlwaysBody": @"Feed and Reels are locked behind your physical key. Return to Marketplace anytime or scan your key for 5 minutes.",
             @"Lock.WallResumeBtn": @"Unlock with key (+5 min)",
             @"Lock.WallSettingsBtn": @"Unlock settings",
-            @"Lock.WallGoMarketplaceBtn": @"Open Marketplace",
+            @"Lock.WallGoMarketplaceBtn": @"Back to Marketplace",
             @"Lock.WallRemainingWait": @"Available in",
             @"Lock.WallUsedToday": @"Used today",
-            @"Lock.EmergencyMenuTitle": @"Key verified",
-            @"Lock.EmergencyPlus5": @"+5 minutes",
-            @"Lock.EmergencyResetToday": @"Reset today's time",
-            @"Lock.EmergencyOpenSettings": @"Open settings",
             @"Lock.ScanStep1": @"Point the camera at your QR code or barcode",
             @"Lock.ScanStep2": @"Scan the same code again to confirm",
             @"Lock.ScanUnlockPrompt": @"Scan your paired key to unlock",
@@ -475,43 +513,58 @@ NSString *FFBLoc(NSString *key) {
         _discoveredMap = [NSMutableDictionary dictionary];
         _discoveredOrder = [NSMutableArray array];
 
-        // Default al primo avvio: SOLO Marketplace attivo e protezioni ON
         [_defaults registerDefaults:@{
-            kKeyEnabled:               @YES,
-            kKeyHasSeenWelcome:        @NO,
-            kKeyLanguageCode:          @"auto",
+            kKeyEnabled:                   @YES,
+            kKeyHasSeenWelcome:            @NO,
+            kKeyLanguageCode:              @"auto",
 
-            kKeyShowMarketplace:       @YES,
-            kKeyShowHome:              @NO,
-            kKeyShowReels:             @NO,
-            kKeyShowFriends:           @NO,
-            kKeyShowGroups:            @NO,
-            kKeyShowNotifications:     @NO,
-            kKeyShowProfile:           @NO,
-            kKeyShowMenu:              @NO,
-            kKeyHideUnknown:           @YES,
+            kKeyShowMarketplace:           @YES,
+            kKeyShowHome:                  @NO,
+            kKeyShowReels:                 @NO,
+            kKeyShowFriends:               @NO,
+            kKeyShowGroups:                @NO,
+            kKeyShowNotifications:         @NO,
+            kKeyShowProfile:               @NO,
+            kKeyShowMenu:                  @NO,
+            kKeyHideUnknown:               @YES,
 
-            kKeyBlockAllAds:           @YES,
-            kKeyHideSuggestedClutter:  @YES,
-            kKeyStartOnMarketplace:    @YES,
-            kKeyShieldHomeFeed:        @YES,
-            kKeyBlockReelsEverywhere:  @YES,
-            kKeyHideStoriesAndReels:   @YES,
-            kKeyReflowVisibleTabs:     @YES,
-            kKeyHideSingleTabBar:      @YES,
+            kKeyBlockAllAds:               @YES,
+            kKeyHidePeopleYouMayKnow:      @YES,
+            kKeyHideReelsCarousel:         @YES,
+            kKeyHideSuggestedClutter:      @YES,
+            kKeyHideStoriesTray:           @NO,
 
-            kKeyTwoFingerLongPress:    @YES,
-            kKeyShowFloatingGear:      @NO
+            kKeyEnableMediaDownload:       @YES,
+            kKeyShowMediaDownloadButton:   @YES,
+
+            kKeyStoriesIncognitoMode:      @YES,
+            kKeyStoriesDisableAutoAdvance: @YES,
+
+            kKeyStartOnMarketplace:        @YES,
+            kKeyShieldHomeFeed:            @YES,
+            kKeyBlockReelsEverywhere:      @YES,
+            kKeyReflowVisibleTabs:         @YES,
+            kKeyHideSingleTabBar:          @YES,
+
+            kKeyTwoFingerLongPress:        @YES,
+            kKeyShowFloatingGear:          @NO
         }];
     }
     return self;
+}
+
+- (uint64_t)prefsGeneration {
+    return gPrefsGenCounter.load(std::memory_order_relaxed);
 }
 
 #pragma mark - Properties
 
 #define FFB_BOOL_PROP(getter, setter, keyConst) \
 - (BOOL)getter { return [_defaults boolForKey:keyConst]; } \
-- (void)setter:(BOOL)val { [_defaults setBool:val forKey:keyConst]; }
+- (void)setter:(BOOL)val { \
+    [_defaults setBool:val forKey:keyConst]; \
+    gPrefsGenCounter.fetch_add(1, std::memory_order_relaxed); \
+}
 
 FFB_BOOL_PROP(enabled, setEnabled, kKeyEnabled)
 FFB_BOOL_PROP(hasSeenWelcome, setHasSeenWelcome, kKeyHasSeenWelcome)
@@ -527,11 +580,20 @@ FFB_BOOL_PROP(showMenuTab, setShowMenuTab, kKeyShowMenu)
 FFB_BOOL_PROP(hideUnknownTabs, setHideUnknownTabs, kKeyHideUnknown)
 
 FFB_BOOL_PROP(blockAllAds, setBlockAllAds, kKeyBlockAllAds)
+FFB_BOOL_PROP(hidePeopleYouMayKnow, setHidePeopleYouMayKnow, kKeyHidePeopleYouMayKnow)
+FFB_BOOL_PROP(hideReelsCarousel, setHideReelsCarousel, kKeyHideReelsCarousel)
 FFB_BOOL_PROP(hideSuggestedClutter, setHideSuggestedClutter, kKeyHideSuggestedClutter)
+FFB_BOOL_PROP(hideStoriesTray, setHideStoriesTray, kKeyHideStoriesTray)
+
+FFB_BOOL_PROP(enableMediaDownload, setEnableMediaDownload, kKeyEnableMediaDownload)
+FFB_BOOL_PROP(showMediaDownloadButton, setShowMediaDownloadButton, kKeyShowMediaDownloadButton)
+
+FFB_BOOL_PROP(storiesIncognitoMode, setStoriesIncognitoMode, kKeyStoriesIncognitoMode)
+FFB_BOOL_PROP(storiesDisableAutoAdvance, setStoriesDisableAutoAdvance, kKeyStoriesDisableAutoAdvance)
+
 FFB_BOOL_PROP(startOnMarketplace, setStartOnMarketplace, kKeyStartOnMarketplace)
 FFB_BOOL_PROP(shieldHomeFeed, setShieldHomeFeed, kKeyShieldHomeFeed)
 FFB_BOOL_PROP(blockReelsEverywhere, setBlockReelsEverywhere, kKeyBlockReelsEverywhere)
-FFB_BOOL_PROP(hideStoriesAndInlineReels, setHideStoriesAndInlineReels, kKeyHideStoriesAndReels)
 FFB_BOOL_PROP(reflowVisibleTabs, setReflowVisibleTabs, kKeyReflowVisibleTabs)
 FFB_BOOL_PROP(hideSingleTabBar, setHideSingleTabBar, kKeyHideSingleTabBar)
 
@@ -544,6 +606,7 @@ FFB_BOOL_PROP(showFloatingGearButton, setShowFloatingGearButton, kKeyShowFloatin
 
 - (void)setLanguageCode:(NSString *)languageCode {
     [_defaults setObject:(languageCode ?: @"auto") forKey:kKeyLanguageCode];
+    gPrefsGenCounter.fetch_add(1, std::memory_order_relaxed);
 }
 
 #pragma mark - Presets
@@ -563,7 +626,8 @@ FFB_BOOL_PROP(showFloatingGearButton, setShowFloatingGearButton, kKeyShowFloatin
     self.startOnMarketplace = YES;
     self.shieldHomeFeed = YES;
     self.blockReelsEverywhere = YES;
-    self.hideStoriesAndInlineReels = YES;
+    self.hideReelsCarousel = YES;
+    self.hidePeopleYouMayKnow = YES;
     [self clearAllOverrides];
     [self notifyChanges];
 }
@@ -584,7 +648,8 @@ FFB_BOOL_PROP(showFloatingGearButton, setShowFloatingGearButton, kKeyShowFloatin
     self.startOnMarketplace = YES;
     self.shieldHomeFeed = YES;
     self.blockReelsEverywhere = YES;
-    self.hideStoriesAndInlineReels = YES;
+    self.hideReelsCarousel = YES;
+    self.hidePeopleYouMayKnow = YES;
     [self clearAllOverrides];
     [self notifyChanges];
 }
@@ -749,11 +814,13 @@ static BOOL FFBContainsAny(NSString *haystack, NSArray<NSString *> *needles) {
         dict[key] = @(mode);
     }
     [_defaults setObject:dict forKey:kKeyCustomOverrides];
+    gPrefsGenCounter.fetch_add(1, std::memory_order_relaxed);
     [self notifyChanges];
 }
 
 - (void)clearAllOverrides {
     [_defaults removeObjectForKey:kKeyCustomOverrides];
+    gPrefsGenCounter.fetch_add(1, std::memory_order_relaxed);
 }
 
 #pragma mark - Live Discovered Tabs Registry
@@ -791,6 +858,7 @@ static BOOL FFBContainsAny(NSString *haystack, NSArray<NSString *> *needles) {
 }
 
 - (void)notifyChanges {
+    gPrefsGenCounter.fetch_add(1, std::memory_order_relaxed);
     [_defaults synchronize];
     dispatch_async(dispatch_get_main_queue(), ^{
         [[NSNotificationCenter defaultCenter] postNotificationName:FocusFBPreferencesDidChangeNotification

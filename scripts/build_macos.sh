@@ -19,7 +19,7 @@ if ! command -v ldid >/dev/null 2>&1; then
 fi
 
 SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
-echo "[*] Building FocusFB.dylib (arm64) with iOS SDK: ${SDK_PATH}"
+echo "[*] Building FocusFB.dylib v2.5 (arm64) with iOS SDK: ${SDK_PATH}"
 
 xcrun --sdk iphoneos clang++ \
   -isysroot "${SDK_PATH}" \
@@ -42,6 +42,8 @@ xcrun --sdk iphoneos clang++ \
   "${PROJECT_DIR}/src/FocusFBSettingsViewController.mm" \
   "${PROJECT_DIR}/src/FocusFBLockManager.mm" \
   "${PROJECT_DIR}/src/FocusFBAdBlocker.mm" \
+  "${PROJECT_DIR}/src/FocusFBStoriesManager.mm" \
+  "${PROJECT_DIR}/src/FocusFBMediaDownloader.mm" \
   -lobjc \
   -framework Foundation \
   -framework CoreFoundation \
@@ -50,7 +52,9 @@ xcrun --sdk iphoneos clang++ \
   -framework CoreGraphics \
   -framework Security \
   -framework AVFoundation \
+  -framework CoreMedia \
   -framework CoreImage \
+  -framework Photos \
   -weak_framework CoreNFC \
   -o "${DIST_DIR}/FocusFB.dylib"
 
@@ -62,7 +66,15 @@ if [[ -n "${INPUT_IPA}" ]]; then
     pipx install --force https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
   fi
   MERGE_PLIST="${DIST_DIR}/focusfb_info_merge.plist"
-  python3 -c 'import plistlib, sys; plistlib.dump({"NFCReaderUsageDescription": "Scan NFC tag to unlock FocusFB"}, open(sys.argv[1], "wb"))' "${MERGE_PLIST}"
+  python3 - "${MERGE_PLIST}" <<'PY'
+import plistlib, sys
+plistlib.dump({
+    "NFCReaderUsageDescription": "Scan physical NFC tag to unlock FocusFB",
+    "NSCameraUsageDescription": "Scan physical QR or barcode to unlock FocusFB",
+    "NSPhotoLibraryAddUsageDescription": "Save downloaded photos and videos to your Camera Roll",
+    "NSPhotoLibraryUsageDescription": "Save downloaded photos and videos to your Photo Library",
+}, open(sys.argv[1], "wb"))
+PY
   cyan -i "${INPUT_IPA}" \
        -o "${DIST_DIR}/FocusFB_Patched.ipa" \
        -u -w -e -q -s --overwrite \

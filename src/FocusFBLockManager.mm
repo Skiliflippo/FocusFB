@@ -860,29 +860,18 @@ API_AVAILABLE(ios(13.0))
 
 - (void)refreshStats {
     FocusFBLockManager *mgr = [FocusFBLockManager shared];
-    BOOL exceptMP = (mgr.lockScope == FFBLockScopeExceptMarketplace);
     BOOL alwaysBlocked = (mgr.sessionLimitMinutes == -1 && !mgr.isDailyLockedOut && mgr.cooldownRemainingSeconds <= 0.5);
     BOOL dailyHit = mgr.isDailyLockedOut;
 
-    _goMarketplaceButton.hidden = !exceptMP;
+    _goMarketplaceButton.hidden = NO;
     _timerBox.hidden = alwaysBlocked;
 
-    if (exceptMP) {
-        if (alwaysBlocked) {
-            _titleLabel.text = FFBLoc(@"Lock.WallExtraAlwaysTitle");
-            _bodyLabel.text = FFBLoc(@"Lock.WallExtraAlwaysBody");
-        } else {
-            _titleLabel.text = dailyHit ? FFBLoc(@"Lock.WallExtraDailyTitle") : FFBLoc(@"Lock.WallExtraSessionTitle");
-            _bodyLabel.text = FFBLoc(@"Lock.WallExtraBody");
-        }
+    if (alwaysBlocked) {
+        _titleLabel.text = FFBLoc(@"Lock.WallExtraAlwaysTitle");
+        _bodyLabel.text = FFBLoc(@"Lock.WallExtraAlwaysBody");
     } else {
-        if (alwaysBlocked) {
-            _titleLabel.text = FFBLoc(@"Lock.WallExtraAlwaysTitle");
-            _bodyLabel.text = FFBLoc(@"Lock.WallSessionBody");
-        } else {
-            _titleLabel.text = dailyHit ? FFBLoc(@"Lock.WallDailyTitle") : FFBLoc(@"Lock.WallSessionTitle");
-            _bodyLabel.text = dailyHit ? FFBLoc(@"Lock.WallDailyBody") : FFBLoc(@"Lock.WallSessionBody");
-        }
+        _titleLabel.text = dailyHit ? FFBLoc(@"Lock.WallExtraDailyTitle") : FFBLoc(@"Lock.WallExtraSessionTitle");
+        _bodyLabel.text = FFBLoc(@"Lock.WallExtraBody");
     }
 
     NSTimeInterval waitSec = dailyHit
@@ -1004,7 +993,7 @@ API_AVAILABLE(ios(13.0))
 - (instancetype)init {
     if ((self = [super init])) {
         _lockScope = FFBLockScopeExceptMarketplace;
-        _sessionLimitMinutes = 0;
+        _sessionLimitMinutes = -1; // Default: Feed/Reels bloccati, Marketplace sempre libero
         _cooldownMinutes = 30;
         _dailyLimitMinutes = 0;
         _showRemainingTimerPill = YES;
@@ -1074,10 +1063,8 @@ API_AVAILABLE(ios(13.0))
         _strictLockActive = NO;
     }
 
-    _lockScope = (FFBLockScope)[(base[@"lockScope"] ?: @0) integerValue];
-    if (_lockScope != FFBLockScopeExceptMarketplace && _lockScope != FFBLockScopeEntireApp) {
-        _lockScope = FFBLockScopeExceptMarketplace;
-    }
+    // v2.5+: Marketplace è SEMPRE escluso dal blocco Foqos (migra automaticamente vecchi stati salvati)
+    _lockScope = FFBLockScopeExceptMarketplace;
 
     NSInteger rawSessionLimit = [(base[@"sessionLimitMinutes"] ?: @0) integerValue];
     _sessionLimitMinutes = (rawSessionLimit == -1) ? -1 : MAX(0, rawSessionLimit);
@@ -1172,9 +1159,9 @@ API_AVAILABLE(ios(13.0))
     [self refreshEnforcementUI];
 }
 
-- (FFBLockScope)lockScope { return _lockScope; }
-- (void)setLockScope:(FFBLockScope)val {
-    _lockScope = (val == FFBLockScopeEntireApp) ? FFBLockScopeEntireApp : FFBLockScopeExceptMarketplace;
+- (FFBLockScope)lockScope { return FFBLockScopeExceptMarketplace; }
+- (void)setLockScope:(__unused FFBLockScope)val {
+    _lockScope = FFBLockScopeExceptMarketplace;
     [self saveStateNow];
     [self refreshEnforcementUI];
     [[NSNotificationCenter defaultCenter] postNotificationName:FocusFBLockStateDidChangeNotification object:self];
@@ -1290,7 +1277,6 @@ API_AVAILABLE(ios(13.0))
 
 - (BOOL)shouldForceMarketplaceOnlyNow {
     if (!_strictLockActive || !self.hasRegisteredKey) return NO;
-    if (_lockScope != FFBLockScopeExceptMarketplace) return NO;
     return self.isQuotaExhaustedNow;
 }
 
@@ -1298,11 +1284,10 @@ API_AVAILABLE(ios(13.0))
     if (!self.isQuotaExhaustedNow) return NO;
     if (_pauseCountingForFocusFBUI) return NO;
 
-    if (_lockScope == FFBLockScopeExceptMarketplace) {
-        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-        if (now < _marketplaceGraceUntil) return NO;
-        if (FocusFBIsUserCurrentlyInMarketplace()) return NO;
-    }
+    // Marketplace è SEMPRE libero 24/7: il blocco Foqos agisce solo su Feed, Reels, Storie e sezioni social
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now < _marketplaceGraceUntil) return NO;
+    if (FocusFBIsUserCurrentlyInMarketplace()) return NO;
     return YES;
 }
 
@@ -1323,9 +1308,7 @@ API_AVAILABLE(ios(13.0))
 }
 
 - (NSString *)formattedRemainingSummary {
-    NSString *scopeTag = (_lockScope == FFBLockScopeExceptMarketplace)
-        ? FFBLoc(@"Lock.ScopeExceptMPBadge")
-        : FFBLoc(@"Lock.ScopeEntireAppBadge");
+    NSString *scopeTag = FFBLoc(@"Lock.ScopeExceptMPBadge");
     NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObject:scopeTag];
 
     if (_sessionLimitMinutes == -1) {
@@ -1400,14 +1383,18 @@ API_AVAILABLE(ios(13.0))
         return;
     }
 
-    [self rolloverMidnightIfNeeded];
-
-    if (_strictLockActive && !self.hasRegisteredKey) {
-        _strictLockActive = NO;
-        [self saveStateNow];
+    if (!_strictLockActive) {
+        if (_lockWindow) {
+            [self refreshEnforcementUI];
+        }
+        return;
     }
 
-    if (!_strictLockActive) {
+    [self rolloverMidnightIfNeeded];
+
+    if (!self.hasRegisteredKey) {
+        _strictLockActive = NO;
+        [self saveStateNow];
         [self refreshEnforcementUI];
         return;
     }
@@ -1629,6 +1616,10 @@ API_AVAILABLE(ios(13.0))
         return NO;
     }
     _strictLockActive = YES;
+    _lockScope = FFBLockScopeExceptMarketplace;
+    if (_sessionLimitMinutes == 0 && _dailyLimitMinutes <= 0) {
+        _sessionLimitMinutes = -1; // Blocca subito Feed/Reels lasciando Marketplace libero
+    }
     _cooldownUntilTimestamp = 0;
     _sessionUsedSeconds = 0;
     _sessionBonusSeconds = 0;

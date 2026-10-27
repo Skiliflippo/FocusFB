@@ -36,6 +36,10 @@ static id FFBHook_objectForInfoDictionaryKey(id self, SEL _cmd, NSString *key) {
         if ([key isEqualToString:@"NSCameraUsageDescription"]) {
             return @"Scansione codice QR o a barre per sbloccare FocusFB.";
         }
+        if ([key isEqualToString:@"NSPhotoLibraryAddUsageDescription"] ||
+            [key isEqualToString:@"NSPhotoLibraryUsageDescription"]) {
+            return @"Salvataggio di foto, video, Reels e Storie nel Rullino.";
+        }
     }
     return orig;
 }

@@ -2,11 +2,14 @@
 #import <UIKit/UIKit.h>
 #import <os/log.h>
 
+#import "FocusFBConfig.h"
 #import "FocusFBPrefs.h"
 #import "FocusFBSideloadFix.h"
 #import "FocusFBTabManager.h"
 #import "FocusFBLockManager.h"
 #import "FocusFBAdBlocker.h"
+#import "FocusFBStoriesManager.h"
+#import "FocusFBMediaDownloader.h"
 
 static BOOL FocusFBShouldActivateInCurrentProcess(void) {
     NSBundle *mainBundle = [NSBundle mainBundle];
@@ -42,16 +45,19 @@ static void FocusFBConstructor(void) {
         }
 
         os_log_with_type(OS_LOG_DEFAULT, OS_LOG_TYPE_INFO,
-                         "[FocusFB 2.0] Loaded in bundle=%{public}@ iOS=%{public}@",
+                         "[FocusFB %{public}@] Loaded in bundle=%{public}@ iOS=%{public}@",
+                         FOCUSFB_VERSION_STRING,
                          NSBundle.mainBundle.bundleIdentifier ?: @"-",
                          UIDevice.currentDevice.systemVersion);
 
         // 1. Applica subito i fix Keychain / AppGroups per Sideloading (SideStore, Feather, LiveContainer)
         FocusFBInstallSideloadFixesIfNeeded();
 
-        // 2. Inizializza preferenze, AdBlock (attivo fin dal primo pacchetto GraphQL/Pando) e Blocco Rigoroso Foqos
+        // 2. Inizializza preferenze, AdBlock + Pulizia Feed, Storie Incognito, Media Downloader e Blocco Foqos
         (void)[FocusFBPrefs shared];
         FocusFBInstallAdBlocker();
+        FocusFBInstallStoriesManager();
+        FocusFBInstallMediaDownloader();
         (void)[FocusFBLockManager shared];
 
         // 3. Avvia il motore UI e il timer limiti sia su DidFinishLaunching sia su main queue

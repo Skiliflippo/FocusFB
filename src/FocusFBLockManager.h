@@ -11,8 +11,7 @@ typedef NS_ENUM(NSInteger, FFBPhysicalKeyType) {
 };
 
 typedef NS_ENUM(NSInteger, FFBLockScope) {
-    FFBLockScopeExceptMarketplace = 0, // Predefinito: blocca tutto tranne Marketplace (Marketplace sempre libero)
-    FFBLockScopeEntireApp         = 1, // Opzionale: blocca tutta l'app Facebook incluso Marketplace
+    FFBLockScopeExceptMarketplace = 0, // Unico ambito v2.5+: blocca solo Feed/Reels/Social, MAI Marketplace
 };
 
 extern NSString *const FocusFBLockStateDidChangeNotification;
