@@ -7,9 +7,9 @@ Works on non-jailbroken devices (SideStore, Feather, AltStore, LiveContainer) an
 ## Features
 
 - **Custom Tabs & Smooth Full-Screen Marketplace**: Hide Home, Reels, Friends, Groups, or Notifications. Defaults to Marketplace-only and removes the bottom bar completely when a single tab is kept, with native 120Hz scrolling.
-- **Ad Blocker & Feed De-cluttering**: Blocks sponsored listings in Marketplace (Home, search, categories) and removes sponsored ads, "People You May Know" boxes, the Reels carousel, suggested posts, and optionally the Stories tray from the Feed.
-- **Media Downloader**: Save videos, Reels, Stories, and high-resolution photos directly to the iOS Camera Roll (including HLS streams) via a long-press gesture or a floating button inside Stories, Reels, and fullscreen media viewers.
-- **Stories Incognito & Manual Advance**: View Stories without sending seen receipts, and stop Stories from automatically advancing to the next item or person.
+- **Ad Blocker & Feed De-cluttering**: Blocks sponsored and boosted listings in Marketplace (Home, search, categories, PDP, and blended GraphQL feeds) and removes sponsored ads, "People You May Know" boxes, the Reels carousel, suggested posts, and optionally the top Stories bar from the Feed.
+- **Video & Reels Downloader (Share Sheet Integration)**: Save Reels, Feed videos, and video Stories in HD (including DASH split-audio and HLS `.m3u8` streams) directly to the iOS Camera Roll from Facebook's native Share / long-press bottom sheet, with an optional quick button for fullscreen players.
+- **Stories Incognito Mode**: View Stories anonymously without sending seen receipts.
 - **Physical Key Lock for Feed & Reels (Foqos-style)**:
   - Pair any physical QR code, product barcode, or NFC tag.
   - Applies strictly to Feed, Reels, Stories, and social tabs — **Marketplace always remains unlocked**.

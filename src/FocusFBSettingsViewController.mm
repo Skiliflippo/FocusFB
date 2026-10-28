@@ -488,7 +488,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
 
     self.adBlockItems = @[ adBlockItem, pymkItem, reelsCarouselItem, suggestedItem, storiesTrayItem ];
 
-    // ── Download Media & Storie in Incognito ──
+    // ── Download Video & Storie in Incognito ──
     self.mediaPrivacyItems = @[
         FFBBoolItem(@"Media.EnableDownload", @"Media.EnableDownloadDesc", @"arrow.down.circle.fill", [UIColor systemBlueColor],
                     ^BOOL(FocusFBPrefs *p) { return p.enableMediaDownload; },
@@ -498,10 +498,7 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
                     ^(FocusFBPrefs *p, BOOL v) { p.showMediaDownloadButton = v; }),
         FFBBoolItem(@"Stories.Incognito", @"Stories.IncognitoDesc", @"eye.slash.circle.fill", [UIColor systemPurpleColor],
                     ^BOOL(FocusFBPrefs *p) { return p.storiesIncognitoMode; },
-                    ^(FocusFBPrefs *p, BOOL v) { p.storiesIncognitoMode = v; }),
-        FFBBoolItem(@"Stories.NoAutoAdvance", @"Stories.NoAutoAdvanceDesc", @"pause.circle.fill", [UIColor systemIndigoColor],
-                    ^BOOL(FocusFBPrefs *p) { return p.storiesDisableAutoAdvance; },
-                    ^(FocusFBPrefs *p, BOOL v) { p.storiesDisableAutoAdvance = v; })
+                    ^(FocusFBPrefs *p, BOOL v) { p.storiesIncognitoMode = v; })
     ];
 
     // ── Blocco con chiave fisica (Foqos — solo Feed/Reels/Social, mai Marketplace) ──

@@ -8,20 +8,17 @@ NS_ASSUME_NONNULL_BEGIN
 extern "C" {
 #endif
 
-/// Installa i moduli Storie (Modalità Incognito senza conferma lettura + Blocco avanzamento automatico)
+/// Installa il modulo Storie in Incognito (nessuna conferma di lettura inviata)
 void FocusFBInstallStoriesManager(void);
 
-/// Notifica l'apertura di un UIViewController per attivare pigramente gli hook FBSnacks solo quando serve
+/// Notifica l'apertura di un UIViewController per agganciare pigramente i manager SeenState di FBSnacks
 void FocusFBNotifyStoryCandidateController(UIViewController * _Nullable vc);
 
 /// Restituisce YES se la richiesta HTTP/GraphQL è una mutazione di "visto" delle Storie da bloccare
 BOOL FocusFBIsStorySeenNetworkRequest(NSURLRequest * _Nullable request);
 
-/// Restituisce YES se il visualizzatore Storie (FBSnacks / StoriesViewer) è attualmente visibile
+/// Restituisce YES se il visualizzatore Storie full-screen (FBSnacks / StoriesViewer) è attualmente visibile
 BOOL FocusFBIsStoryViewerVisibleNow(void);
-
-/// Timestamp CFAbsoluteTimeGetCurrent() dell'ultimo tocco utente sullo schermo
-double FocusFBLastUserTouchTimestamp(void);
 
 #ifdef __cplusplus
 }

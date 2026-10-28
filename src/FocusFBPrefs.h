@@ -61,13 +61,12 @@ typedef NS_ENUM(NSInteger, FocusFBOverrideMode) {
 @property (nonatomic, assign) BOOL hideSuggestedClutter;
 @property (nonatomic, assign) BOOL hideStoriesTray;
 
-// Download Media (Video, Reels, Foto e Storie nel Rullino)
+// Download Video & Reels (nel menu Condividi / Opzioni + pulsante rapido opzionale)
 @property (nonatomic, assign) BOOL enableMediaDownload;
 @property (nonatomic, assign) BOOL showMediaDownloadButton;
 
-// Storie in Incognito & Controllo Avanzamento
+// Storie in Incognito
 @property (nonatomic, assign) BOOL storiesIncognitoMode;
-@property (nonatomic, assign) BOOL storiesDisableAutoAdvance;
 
 // Protezioni Anti-Distrazione & Layout
 @property (nonatomic, assign) BOOL startOnMarketplace;

@@ -24,10 +24,9 @@ static NSString * const kKeyHideSuggestedClutter      = @"FocusFB_HideSuggestedC
 static NSString * const kKeyHideStoriesTray           = @"FocusFB_HideStoriesTray";
 
 static NSString * const kKeyEnableMediaDownload       = @"FocusFB_EnableMediaDownload";
-static NSString * const kKeyShowMediaDownloadButton   = @"FocusFB_ShowMediaDownloadButton";
+static NSString * const kKeyShowMediaDownloadButton   = @"FocusFB_ShowVideoQuickButton";
 
 static NSString * const kKeyStoriesIncognitoMode      = @"FocusFB_StoriesIncognitoMode";
-static NSString * const kKeyStoriesDisableAutoAdvance = @"FocusFB_StoriesDisableAutoAdvance";
 
 static NSString * const kKeyStartOnMarketplace        = @"FocusFB_StartOnMarketplace";
 static NSString * const kKeyShieldHomeFeed            = @"FocusFB_ShieldHomeFeed";
@@ -59,8 +58,8 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"Sec.Master": @"Generale",
             @"Sec.AdBlock": @"Pulizia Feed e pubblicità",
             @"Sec.AdBlockFooter": @"Rimuove annunci sponsorizzati, carosello Reels, suggerimenti di amicizia e contenuti consigliati.",
-            @"Sec.MediaPrivacy": @"Download e Storie in incognito",
-            @"Sec.MediaPrivacyFooter": @"Tieni premuto su foto, video, Reels o Storie (oppure usa il pulsante salva) per scaricarli nel Rullino.",
+            @"Sec.MediaPrivacy": @"Download video e Storie in incognito",
+            @"Sec.MediaPrivacyFooter": @"Quando apri il menu Condividi (o tieni premuto un Reel), appare il pulsante Scarica video per salvarlo nel Rullino.",
             @"Sec.Presets": @"Configurazioni rapide",
             @"Sec.Tabs": @"Schede visibili",
             @"Sec.TabsFooter": @"Scegli quali schede tenere nella barra in basso.",
@@ -89,27 +88,25 @@ static NSDictionary<NSString *, NSString *> *FFBItalianStrings(void) {
             @"AdBlock.HideStoriesTray": @"Nascondi barra Storie",
             @"AdBlock.HideStoriesTrayDesc": @"Nasconde la riga delle Storie in cima al Feed.",
 
-            // Download & Storie in incognito
-            @"Media.EnableDownload": @"Download foto, video, Reels e Storie",
-            @"Media.EnableDownloadDesc": @"Tieni premuto su un contenuto multimediale per salvarlo nel Rullino.",
-            @"Media.ShowButton": @"Pulsante salva su Reels e Storie",
-            @"Media.ShowButtonDesc": @"Mostra un pulsante rapido quando apri un Reel, un video o una Storia.",
+            // Download Video & Storie in incognito
+            @"Media.EnableDownload": @"Scarica video e Reels",
+            @"Media.EnableDownloadDesc": @"Aggiunge il pulsante Scarica video nel menu di condivisione di Reels, video e Storie.",
+            @"Media.ShowButton": @"Pulsante rapido in sovrimpressione",
+            @"Media.ShowButtonDesc": @"Mostra anche un'icona salva direttamente sopra Reels e Storie video.",
             @"Stories.Incognito": @"Storie in incognito",
             @"Stories.IncognitoDesc": @"Guarda le Storie degli amici senza comparire nella lista visualizzazioni.",
-            @"Stories.NoAutoAdvance": @"Ferma avanzamento automatico Storie",
-            @"Stories.NoAutoAdvanceDesc": @"Impedisce il passaggio automatico alla Storia o persona successiva.",
 
-            // Stringhe UI Download Media
-            @"DL.SheetTitle": @"Salva contenuto",
+            // Stringhe UI Download Video
+            @"DL.ShareBarAction": @"Scarica video",
+            @"DL.ShareBarSub": @"Salva nel Rullino (HD)",
+            @"DL.SheetTitle": @"Scarica video",
             @"DL.SaveVideoHD": @"Salva video nel Rullino (HD)",
             @"DL.SaveVideoSD": @"Salva video nel Rullino (SD)",
             @"DL.SaveVideo": @"Salva video nel Rullino",
-            @"DL.SavePhoto": @"Salva foto nel Rullino",
-            @"DL.Share": @"Condividi...",
-            @"DL.Downloading": @"Download in corso...",
+            @"DL.Share": @"Condividi file video...",
+            @"DL.Downloading": @"Download video in corso...",
             @"DL.SavedVideo": @"Video salvato nel Rullino",
-            @"DL.SavedPhoto": @"Foto salvata nel Rullino",
-            @"DL.Failed": @"Impossibile scaricare questo contenuto",
+            @"DL.Failed": @"Impossibile scaricare questo video",
             @"DL.NotFound": @"Avvia il video per un istante e riprova",
 
             // Presets
@@ -280,8 +277,8 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"Sec.Master": @"General",
             @"Sec.AdBlock": @"Feed cleanup & ads",
             @"Sec.AdBlockFooter": @"Removes sponsored ads, Reels carousels, friend suggestions, and recommended posts.",
-            @"Sec.MediaPrivacy": @"Media downloads & incognito Stories",
-            @"Sec.MediaPrivacyFooter": @"Long-press any photo, video, Reel, or Story (or tap the save button) to save directly to Photos.",
+            @"Sec.MediaPrivacy": @"Video downloads & incognito Stories",
+            @"Sec.MediaPrivacyFooter": @"Open the Share menu (or long-press a Reel) to reveal the Download Video button and save directly to Photos.",
             @"Sec.Presets": @"Quick modes",
             @"Sec.Tabs": @"Visible tabs",
             @"Sec.TabsFooter": @"Choose which tabs stay on the bottom bar.",
@@ -308,25 +305,23 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"AdBlock.HideStoriesTray": @"Hide Stories bar",
             @"AdBlock.HideStoriesTrayDesc": @"Hides the Stories row at the top of the Feed.",
 
-            @"Media.EnableDownload": @"Download photos, videos, Reels & Stories",
-            @"Media.EnableDownloadDesc": @"Long-press any media item to save it directly to Photos.",
-            @"Media.ShowButton": @"Quick save button on Reels & Stories",
-            @"Media.ShowButtonDesc": @"Shows a clean save icon inside Reels, fullscreen videos, and Stories.",
+            @"Media.EnableDownload": @"Download videos & Reels",
+            @"Media.EnableDownloadDesc": @"Adds a Download Video button inside Facebook's Share menu on Reels, videos, and Stories.",
+            @"Media.ShowButton": @"Floating save button on videos",
+            @"Media.ShowButtonDesc": @"Also show an on-screen save icon inside Reels and video Stories.",
             @"Stories.Incognito": @"Incognito Stories",
             @"Stories.IncognitoDesc": @"Watch friends' Stories without sending a viewed receipt.",
-            @"Stories.NoAutoAdvance": @"Stop Story auto-advance",
-            @"Stories.NoAutoAdvanceDesc": @"Prevents Stories from automatically advancing to the next person.",
 
-            @"DL.SheetTitle": @"Save media",
+            @"DL.ShareBarAction": @"Download video",
+            @"DL.ShareBarSub": @"Save to Photos (HD)",
+            @"DL.SheetTitle": @"Download video",
             @"DL.SaveVideoHD": @"Save Video to Photos (HD)",
             @"DL.SaveVideoSD": @"Save Video to Photos (SD)",
             @"DL.SaveVideo": @"Save Video to Photos",
-            @"DL.SavePhoto": @"Save Photo to Photos",
-            @"DL.Share": @"Share...",
-            @"DL.Downloading": @"Downloading...",
+            @"DL.Share": @"Share video file...",
+            @"DL.Downloading": @"Downloading video...",
             @"DL.SavedVideo": @"Video saved to Photos",
-            @"DL.SavedPhoto": @"Photo saved to Photos",
-            @"DL.Failed": @"Could not download this media",
+            @"DL.Failed": @"Could not download this video",
             @"DL.NotFound": @"Play the video briefly and try again",
 
             @"Preset.MarketplaceOnly": @"Marketplace only",
@@ -535,10 +530,9 @@ NSString *FFBLoc(NSString *key) {
             kKeyHideStoriesTray:           @NO,
 
             kKeyEnableMediaDownload:       @YES,
-            kKeyShowMediaDownloadButton:   @YES,
+            kKeyShowMediaDownloadButton:   @NO,
 
             kKeyStoriesIncognitoMode:      @YES,
-            kKeyStoriesDisableAutoAdvance: @YES,
 
             kKeyStartOnMarketplace:        @YES,
             kKeyShieldHomeFeed:            @YES,
@@ -589,7 +583,6 @@ FFB_BOOL_PROP(enableMediaDownload, setEnableMediaDownload, kKeyEnableMediaDownlo
 FFB_BOOL_PROP(showMediaDownloadButton, setShowMediaDownloadButton, kKeyShowMediaDownloadButton)
 
 FFB_BOOL_PROP(storiesIncognitoMode, setStoriesIncognitoMode, kKeyStoriesIncognitoMode)
-FFB_BOOL_PROP(storiesDisableAutoAdvance, setStoriesDisableAutoAdvance, kKeyStoriesDisableAutoAdvance)
 
 FFB_BOOL_PROP(startOnMarketplace, setStartOnMarketplace, kKeyStartOnMarketplace)
 FFB_BOOL_PROP(shieldHomeFeed, setShieldHomeFeed, kKeyShieldHomeFeed)

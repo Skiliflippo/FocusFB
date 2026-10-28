@@ -11,7 +11,20 @@
 @interface NSObject (FFBGraphQLModelSelectors)
 - (nullable id)category;
 - (nullable id)sponsoredData;
+- (nullable id)adData;
+- (nullable id)marketplaceAdData;
+- (nullable id)boostedMarketplaceListing;
+- (nullable id)promotedListingInfo;
+- (nullable id)adImpressionClientToken;
+- (nullable id)adID;
+- (nullable id)adId;
+- (nullable id)node;
+- (nullable id)listing;
+- (nullable id)story;
+- (nullable id)tracking;
 - (BOOL)isSponsored;
+- (BOOL)isAd;
+- (BOOL)isBoosted;
 - (nullable id)storyBucketType;
 @end
 
@@ -30,8 +43,7 @@ static std::atomic<uint64_t> gBlockedAdsCount{0};
 static std::atomic<bool> gAdBlockerReady{false};
 static thread_local bool gInsideInternalJSONPass = false;
 
-// IMPORTANTE: per i selettori della famiglia -init* usiamo void* grezzi così Clang ARC
-// rispetta esattamente la convenzione ns_consumed (self +1) -> ns_returns_retained (+1)!
+// Convenzione esatta ns_consumed (self +1) -> ns_returns_retained (+1) per i metodi -init*
 typedef void *(*FFBPandoRawInitIMP)(void *, SEL, void *);
 typedef id (*FFBJSONDataIMP)(id, SEL, NSData *, NSJSONReadingOptions, NSError * __autoreleasing *);
 typedef id (*FFBRCTHandlerIMP)(id, SEL, NSURLRequest *);
@@ -57,7 +69,7 @@ struct FFBFilterFlags {
         return blockAds || hidePYMK || hideReelsCarousel || hideSuggested || hideStoriesTray;
     }
     bool anyJSONActive() const noexcept {
-        return blockAds || hidePYMK || hideReelsCarousel || hideSuggested;
+        return blockAds || hidePYMK || hideReelsCarousel || hideSuggested || hideStoriesTray;
     }
 };
 
@@ -80,13 +92,13 @@ NSUInteger FocusFBBlockedAdsCount(void) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Helper Runtime Sicuri (Thread-Safe, Zero Overhead NSMethodSignature)
+// Helper Runtime Sicuri (Zero Overhead NSMethodSignature)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static BOOL FFBMethodReturnsObject(Class cls, SEL sel) {
     if (!cls || !sel) return NO;
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
+    if (!m || method_getNumberOfArguments(m) != 2) return NO;
     const char *enc = method_getTypeEncoding(m);
     return (enc != NULL && enc[0] == '@');
 }
@@ -94,7 +106,7 @@ static BOOL FFBMethodReturnsObject(Class cls, SEL sel) {
 static BOOL FFBMethodReturnsBool(Class cls, SEL sel) {
     if (!cls || !sel) return NO;
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) return NO;
+    if (!m || method_getNumberOfArguments(m) != 2) return NO;
     const char *enc = method_getTypeEncoding(m);
     return (enc != NULL && (enc[0] == 'B' || enc[0] == 'c'));
 }
@@ -133,12 +145,19 @@ static BOOL FFBInstallMethodHook(Class cls, SEL sel, IMP newIMP, IMP *origOut) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Riconoscimento Unificato Nodi/Edge Pubblicitari, PYMK & Reels Carousel
+// Riconoscimento Unificato Nodi/Edge Pubblicitari, Marketplace Ads, PYMK, Reels & Storie
 // ─────────────────────────────────────────────────────────────────────────────
 
 static inline BOOL FFBHasNonNullValue(NSDictionary *dict, NSString *key) {
     id v = dict[key];
     return (v != nil && ![v isKindOfClass:NSNull.class]);
+}
+
+static inline BOOL FFBHasTruthyBool(NSDictionary *dict, NSString *key) {
+    id v = dict[key];
+    if ([v isKindOfClass:NSNumber.class]) return [(NSNumber *)v boolValue];
+    if ([v isKindOfClass:NSString.class]) return [(NSString *)v isEqualToString:@"true"] || [(NSString *)v isEqualToString:@"1"];
+    return NO;
 }
 
 static BOOL FFBIsAdTypenameString(NSString *tn) {
@@ -147,7 +166,7 @@ static BOOL FFBIsAdTypenameString(NSString *tn) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         adTypeRegex = [NSRegularExpression
-            regularExpressionWithPattern:@"(?:Ads?[A-Z])|Sponsored|(?:StoryAd$)|(?:BannerAd$)"
+            regularExpressionWithPattern:@"(?:Ads?[A-Z])|Sponsored|(?:StoryAd$)|(?:BannerAd$)|(?:AdStory)|(?:AdUnit)|(?:AdCard)|(?:BoostedListing)|(?:PromotedListing)|(?:MarketplaceAd)"
                                  options:0
                                    error:nil];
     });
@@ -164,8 +183,6 @@ static BOOL FFBIsPYMKTypenameString(NSString *tn) {
 
 static BOOL FFBIsReelsCarouselTypenameString(NSString *tn) {
     if (![tn isKindOfClass:NSString.class] || tn.length < 6) return NO;
-    // Matcha solo unità/caroselli nel Feed (es. FbShortsFeedUnit, ReelsFeedUnit, ClipsHomeUnit),
-    // mai il singolo oggetto video riprodotto quando apri intenzionalmente un video.
     return ([tn rangeOfString:@"ShortsFeedUnit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
             [tn rangeOfString:@"ShortsInFeed" options:NSCaseInsensitiveSearch].location != NSNotFound ||
             [tn rangeOfString:@"ReelsFeedUnit" options:NSCaseInsensitiveSearch].location != NSNotFound ||
@@ -183,38 +200,68 @@ static BOOL FFBIsSuggestedTypenameString(NSString *tn) {
             [tn rangeOfString:@"SingleBucketInlineViewer" options:NSCaseInsensitiveSearch].location != NSNotFound);
 }
 
+static BOOL FFBIsStoriesTrayTypenameString(NSString *tn) {
+    if (![tn isKindOfClass:NSString.class] || tn.length < 6) return NO;
+    return ([tn rangeOfString:@"StoriesTray" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"SnacksTray" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"InlineSnacks" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"StoriesSingleBucketInlineViewer" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [tn rangeOfString:@"UnifiedStoriesConnection" options:NSCaseInsensitiveSearch].location != NSNotFound);
+}
+
+static BOOL FFBTrackingStringLooksSponsored(NSString *tracking) {
+    if (![tracking isKindOfClass:NSString.class] || tracking.length < 10 || tracking.length > 8192) return NO;
+    return ([tracking containsString:@"\"is_sponsored\":true"] ||
+            [tracking containsString:@"\"is_sponsored\":1"] ||
+            [tracking containsString:@"\"ad_id\":\""] ||
+            [tracking containsString:@"\"boosted_component\""] ||
+            [tracking containsString:@"\"ad_impression_token\""]);
+}
+
 static BOOL FFBDictHasDirectFilterMarkers(NSDictionary *d, const FFBFilterFlags &flags, BOOL *outIsAd) {
     if (![d isKindOfClass:NSDictionary.class]) return NO;
 
-    NSString *cat = d[@"category"];
-    if ([cat isKindOfClass:NSString.class]) {
+    for (NSString *catKey in @[@"category", @"story_type", @"edge_type", @"feed_edge_type", @"item_type"]) {
+        NSString *cat = d[catKey];
+        if (![cat isKindOfClass:NSString.class] || cat.length == 0) continue;
+        NSString *upper = cat.uppercaseString;
         if (flags.blockAds &&
-            ([cat isEqualToString:@"SPONSORED"] ||
-             [cat isEqualToString:@"AD"] ||
-             [cat isEqualToString:@"ADS"] ||
-             [cat isEqualToString:@"MARKETPLACE_ADS"] ||
-             [cat isEqualToString:@"SPONSORED_STORY"] ||
-             [cat containsString:@"SPONSOR"])) {
+            ([upper isEqualToString:@"SPONSORED"] ||
+             [upper isEqualToString:@"AD"] ||
+             [upper isEqualToString:@"ADS"] ||
+             [upper isEqualToString:@"MARKETPLACE_ADS"] ||
+             [upper isEqualToString:@"MARKETPLACE_AD"] ||
+             [upper isEqualToString:@"SPONSORED_STORY"] ||
+             [upper containsString:@"SPONSOR"] ||
+             [upper containsString:@"BOOSTED"] ||
+             [upper containsString:@"PROMOTED"])) {
             if (outIsAd) *outIsAd = YES;
             return YES;
         }
         if (flags.hidePYMK &&
-            ([cat isEqualToString:@"PYMK"] ||
-             [cat isEqualToString:@"PYMK_STORY"] ||
-             [cat isEqualToString:@"FRIENDING"])) {
+            ([upper isEqualToString:@"PYMK"] ||
+             [upper isEqualToString:@"PYMK_STORY"] ||
+             [upper isEqualToString:@"FRIENDING"])) {
             return YES;
         }
         if (flags.hideReelsCarousel &&
-            ([cat isEqualToString:@"FB_SHORTS"] ||
-             [cat isEqualToString:@"FB_SHORTS_FALLBACK"] ||
-             [cat isEqualToString:@"SHORT_FORM_VIDEO"] ||
-             [cat containsString:@"FB_SHORTS"])) {
+            ([upper isEqualToString:@"FB_SHORTS"] ||
+             [upper isEqualToString:@"FB_SHORTS_FALLBACK"] ||
+             [upper isEqualToString:@"SHORT_FORM_VIDEO"] ||
+             [upper containsString:@"FB_SHORTS"])) {
             return YES;
         }
         if (flags.hideSuggested &&
-            ([cat isEqualToString:@"ENGAGEMENT"] ||
-             [cat isEqualToString:@"ENGAGEMENT_QP"] ||
-             [cat isEqualToString:@"RECOMMENDATION"])) {
+            ([upper isEqualToString:@"ENGAGEMENT"] ||
+             [upper isEqualToString:@"ENGAGEMENT_QP"] ||
+             [upper isEqualToString:@"RECOMMENDATION"])) {
+            return YES;
+        }
+        if (flags.hideStoriesTray &&
+            ([upper isEqualToString:@"MULTI_FB_STORIES_TRAY"] ||
+             [upper isEqualToString:@"STORIES_TRAY"] ||
+             [upper isEqualToString:@"SNACKS_TRAY"] ||
+             [upper isEqualToString:@"FB_STORIES"])) {
             return YES;
         }
     }
@@ -234,28 +281,52 @@ static BOOL FFBDictHasDirectFilterMarkers(NSDictionary *d, const FFBFilterFlags 
         if (flags.hideSuggested && FFBIsSuggestedTypenameString(tn)) {
             return YES;
         }
+        if (flags.hideStoriesTray && FFBIsStoriesTrayTypenameString(tn)) {
+            return YES;
+        }
     }
 
     if (!flags.blockAds) return NO;
 
     if (FFBHasNonNullValue(d, @"sponsored_data") ||
+        FFBHasNonNullValue(d, @"sponsoredData") ||
         FFBHasNonNullValue(d, @"ad_data") ||
+        FFBHasNonNullValue(d, @"adData") ||
         FFBHasNonNullValue(d, @"marketplace_ad_data") ||
+        FFBHasNonNullValue(d, @"marketplaceAdData") ||
         FFBHasNonNullValue(d, @"boosted_marketplace_listing") ||
+        FFBHasNonNullValue(d, @"boostedMarketplaceListing") ||
         FFBHasNonNullValue(d, @"promoted_listing_info") ||
-        FFBHasNonNullValue(d, @"ad_impression_client_token")) {
+        FFBHasNonNullValue(d, @"promotedListingInfo") ||
+        FFBHasNonNullValue(d, @"ad_impression_client_token") ||
+        FFBHasNonNullValue(d, @"ad_logging_info") ||
+        FFBHasNonNullValue(d, @"sponsored_impression_url")) {
         if (outIsAd) *outIsAd = YES;
         return YES;
     }
 
-    id adId = d[@"ad_id"];
-    if ([adId isKindOfClass:NSString.class] && ((NSString *)adId).length > 0) {
+    for (NSString *adIdKey in @[@"ad_id", @"adId"]) {
+        id adId = d[adIdKey];
+        if (([adId isKindOfClass:NSString.class] && ((NSString *)adId).length > 0) ||
+            ([adId isKindOfClass:NSNumber.class] && [(NSNumber *)adId longLongValue] > 0)) {
+            if (outIsAd) *outIsAd = YES;
+            return YES;
+        }
+    }
+
+    if (FFBHasTruthyBool(d, @"is_sponsored") ||
+        FFBHasTruthyBool(d, @"isSponsored") ||
+        FFBHasTruthyBool(d, @"is_ad") ||
+        FFBHasTruthyBool(d, @"isAd") ||
+        FFBHasTruthyBool(d, @"is_boosted") ||
+        FFBHasTruthyBool(d, @"isBoosted") ||
+        FFBHasTruthyBool(d, @"is_promoted") ||
+        FFBHasTruthyBool(d, @"isPromoted")) {
         if (outIsAd) *outIsAd = YES;
         return YES;
     }
 
-    id isSpons = d[@"is_sponsored"];
-    if ([isSpons isKindOfClass:NSNumber.class] && [(NSNumber *)isSpons boolValue]) {
+    if (FFBTrackingStringLooksSponsored(d[@"tracking"])) {
         if (outIsAd) *outIsAd = YES;
         return YES;
     }
@@ -263,28 +334,53 @@ static BOOL FFBDictHasDirectFilterMarkers(NSDictionary *d, const FFBFilterFlags 
     return NO;
 }
 
+// Evita di scartare un contenitore radice (es. "marketplace_feed_stories" o "viewer") che contiene più edge organici
+static BOOL FFBDictContainsMultiItemConnection(NSDictionary *dict, NSUInteger depth) {
+    if (![dict isKindOfClass:NSDictionary.class] || depth > 2) return NO;
+    for (NSString *connKey in @[@"edges", @"nodes", @"feed_units", @"units", @"results"]) {
+        id arr = dict[connKey];
+        if ([arr isKindOfClass:NSArray.class] && ((NSArray *)arr).count >= 2) {
+            return YES;
+        }
+    }
+    for (id key in dict) {
+        id val = dict[key];
+        if ([val isKindOfClass:NSDictionary.class]) {
+            if (FFBDictContainsMultiItemConnection((NSDictionary *)val, depth + 1)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+// Scansiona un singolo edge fino a profondità 4 per catturare annunci Marketplace annidati (es. edge.node.renderable.sponsored_data)
+static BOOL FFBDictSubtreeMatchesFilter(NSDictionary *dict,
+                                        const FFBFilterFlags &flags,
+                                        NSUInteger depth,
+                                        BOOL *outIsAd) {
+    if (![dict isKindOfClass:NSDictionary.class] || depth > 4) return NO;
+    if (FFBDictHasDirectFilterMarkers(dict, flags, outIsAd)) return YES;
+    if (depth >= 4) return NO;
+
+    for (id key in dict) {
+        id val = dict[key];
+        if ([val isKindOfClass:NSDictionary.class]) {
+            if (FFBDictSubtreeMatchesFilter((NSDictionary *)val, flags, depth + 1, outIsAd)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
 static BOOL FFBShouldDropJSONItem(id item, const FFBFilterFlags &flags, BOOL *outIsAd) {
     if (![item isKindOfClass:NSDictionary.class]) return NO;
     NSDictionary *dict = (NSDictionary *)item;
-
-    if (FFBDictHasDirectFilterMarkers(dict, flags, outIsAd)) return YES;
-
-    NSDictionary *node = [dict[@"node"] isKindOfClass:NSDictionary.class] ? dict[@"node"] : nil;
-    if (node) {
-        if (FFBDictHasDirectFilterMarkers(node, flags, outIsAd)) return YES;
-        NSDictionary *nodeStory = [node[@"story"] isKindOfClass:NSDictionary.class] ? node[@"story"] : nil;
-        if (nodeStory && FFBDictHasDirectFilterMarkers(nodeStory, flags, outIsAd)) return YES;
-        NSDictionary *nodeListing = [node[@"listing"] isKindOfClass:NSDictionary.class] ? node[@"listing"] : nil;
-        if (nodeListing && FFBDictHasDirectFilterMarkers(nodeListing, flags, outIsAd)) return YES;
+    if (FFBDictContainsMultiItemConnection(dict, 0)) {
+        return NO;
     }
-
-    NSDictionary *story = [dict[@"story"] isKindOfClass:NSDictionary.class] ? dict[@"story"] : nil;
-    if (story && FFBDictHasDirectFilterMarkers(story, flags, outIsAd)) return YES;
-
-    NSDictionary *listing = [dict[@"listing"] isKindOfClass:NSDictionary.class] ? dict[@"listing"] : nil;
-    if (listing && FFBDictHasDirectFilterMarkers(listing, flags, outIsAd)) return YES;
-
-    return NO;
+    return FFBDictSubtreeMatchesFilter(dict, flags, 0, outIsAd);
 }
 
 static inline BOOL FFBBytesContainASCII(const uint8_t *buf, size_t bufLen, const char *pat, size_t patLen) {
@@ -292,25 +388,31 @@ static inline BOOL FFBBytesContainASCII(const uint8_t *buf, size_t bufLen, const
     return std::search(buf, buf + bufLen, p, p + patLen) != (buf + bufLen);
 }
 
-// Fast-path C++ sub-millisecondo: evita conversione NSString e NSJSONSerialization
-// sulle pagine pulite di Marketplace durante lo scroll veloce!
 static BOOL FFBDataMayContainFilterableTokens(NSData *data, const FFBFilterFlags &flags) {
     const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
     size_t len = (size_t)data.length;
-    if (!bytes || len < 48) return NO;
+    if (!bytes || len < 40) return NO;
 
     if (flags.blockAds) {
         if (FFBBytesContainASCII(bytes, len, "sponsored", 9)) return YES;
         if (FFBBytesContainASCII(bytes, len, "SPONSORED", 9)) return YES;
         if (FFBBytesContainASCII(bytes, len, "Sponsored", 9)) return YES;
         if (FFBBytesContainASCII(bytes, len, "ad_data", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "adData", 6))    return YES;
         if (FFBBytesContainASCII(bytes, len, "\"ad_id\"", 7)) return YES;
-        if (FFBBytesContainASCII(bytes, len, "boosted_", 8))  return YES;
-        if (FFBBytesContainASCII(bytes, len, "promoted_", 9)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "\"adId\"", 6))  return YES;
+        if (FFBBytesContainASCII(bytes, len, "is_ad", 5))     return YES;
+        if (FFBBytesContainASCII(bytes, len, "boosted", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "Boosted", 7))   return YES;
+        if (FFBBytesContainASCII(bytes, len, "promoted", 8))  return YES;
+        if (FFBBytesContainASCII(bytes, len, "Promoted", 8))  return YES;
         if (FFBBytesContainASCII(bytes, len, "AdStory", 7))   return YES;
         if (FFBBytesContainASCII(bytes, len, "AdsFeed", 7))   return YES;
         if (FFBBytesContainASCII(bytes, len, "AdUnit", 6))    return YES;
+        if (FFBBytesContainASCII(bytes, len, "AdCard", 6))    return YES;
         if (FFBBytesContainASCII(bytes, len, "BannerAd", 8))  return YES;
+        if (FFBBytesContainASCII(bytes, len, "MarketplaceAd", 13)) return YES;
+        if (FFBBytesContainASCII(bytes, len, "\"Ads", 4))     return YES;
     }
     if (flags.hidePYMK) {
         if (FFBBytesContainASCII(bytes, len, "PYMK", 4))             return YES;
@@ -327,6 +429,13 @@ static BOOL FFBDataMayContainFilterableTokens(NSData *data, const FFBFilterFlags
         if (FFBBytesContainASCII(bytes, len, "GroupsYouShouldJoin", 19)) return YES;
         if (FFBBytesContainASCII(bytes, len, "PagesYouMayLike", 15))     return YES;
         if (FFBBytesContainASCII(bytes, len, "ThreadsInFeed", 13))       return YES;
+    }
+    if (flags.hideStoriesTray) {
+        if (FFBBytesContainASCII(bytes, len, "STORIES_TRAY", 12))           return YES;
+        if (FFBBytesContainASCII(bytes, len, "StoriesTray", 11))            return YES;
+        if (FFBBytesContainASCII(bytes, len, "SnacksTray", 10))             return YES;
+        if (FFBBytesContainASCII(bytes, len, "unified_stories", 15))        return YES;
+        if (FFBBytesContainASCII(bytes, len, "stories_tray", 12))           return YES;
     }
     return NO;
 }
@@ -377,16 +486,19 @@ static BOOL FFBIsDedicatedAdQueryName(NSString *name) {
             @"MarketplaceHomeFeedAdsPaginationQuery",
             @"MarketplaceHomeFeedBoostedListingAdsQuery",
             @"MarketplaceHomeFeedBoostedListingAdsPaginationQuery",
+            @"MarketplaceHomeFeedAdsThemedQuery",
             @"MarketplacePDPBoostedListingAdsQuery",
             @"MarketplacePDPPersonalizedAdsQuery",
             @"MarketplaceProductDetailsPageRelatedAdsDetailQuery",
             @"MarketplaceSearchAdsQuery",
             @"MarketplaceSearchAdsPaginationQuery",
             @"MarketplaceCategoryFeedAdsQuery",
-            @"MarketplaceBrowseAdsQuery"
+            @"MarketplaceBrowseAdsQuery",
+            @"MarketplaceForYouFeedAdsQuery",
+            @"MarketplaceLocalFeedAdsQuery"
         ]];
         adQueryRegex = [NSRegularExpression
-            regularExpressionWithPattern:@"(?:^Marketplace\\w*Ads?(?:[A-Z]\\w*)?Query$)|(?:AdsQueryRendererQuery$)|(?:BoostedListingAds)|(?:RelatedAdsDetailQuery$)"
+            regularExpressionWithPattern:@"(?:^(?:Comet)?(?:Marketplace|Commerce)\\w*(?:Ads?|Sponsored|Boosted|Promoted)(?:[A-Z]\\w*)?(?:Query|RendererQuery|PaginationQuery)$)|(?:AdsQueryRendererQuery$)|(?:BoostedListingAds)|(?:PromotedListingAds)|(?:RelatedAdsDetailQuery$)"
                                  options:0
                                    error:nil];
     });
@@ -395,34 +507,63 @@ static BOOL FFBIsDedicatedAdQueryName(NSString *name) {
     return [adQueryRegex firstMatchInString:name options:0 range:NSMakeRange(0, name.length)] != nil;
 }
 
-static BOOL FFBShouldFilterRCTResponseForQuery(NSString *name) {
+static BOOL FFBIsStoriesTrayQueryName(NSString *name) {
     if (name.length == 0) return NO;
-    return ([name hasPrefix:@"Marketplace"] ||
-            [name containsString:@"Marketplace"] ||
-            [name containsString:@"Commerce"] ||
-            [name containsString:@"Feed"] ||
-            [name containsString:@"Search"]);
+    return ([name rangeOfString:@"SnacksTray" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [name rangeOfString:@"StoriesTray" options:NSCaseInsensitiveSearch].location != NSNotFound ||
+            [name rangeOfString:@"UnifiedStoriesBuckets" options:NSCaseInsensitiveSearch].location != NSNotFound);
 }
 
+static BOOL FFBShouldFilterRCTResponse(NSURLRequest *request, NSString * _Nullable name) {
+    if (name.length > 0) {
+        // Non filtrare mutazioni di scrittura (es. invio messaggio / creazione annuncio)
+        if ([name hasSuffix:@"Mutation"]) return NO;
+        return YES;
+    }
+    NSString *path = request.URL.path.lowercaseString ?: @"";
+    return [path containsString:@"graphql"];
+}
+
+// Rimozione Bottom-Up: prima ripulisce gli array figli (es. edges interni), poi scarta il singolo edge sponsorizzato!
 static NSUInteger FFBStripMutableJSONInPlace(id obj, const FFBFilterFlags &flags, NSUInteger depth, NSUInteger *outAdsCount) {
-    if (!obj || depth > 24) return 0;
+    if (!obj || depth > 26) return 0;
     NSUInteger removed = 0;
 
     if ([obj isKindOfClass:NSMutableArray.class]) {
         NSMutableArray *arr = (NSMutableArray *)obj;
         for (NSInteger i = (NSInteger)arr.count - 1; i >= 0; i--) {
             id item = arr[(NSUInteger)i];
+            removed += FFBStripMutableJSONInPlace(item, flags, depth + 1, outAdsCount);
+
             BOOL isAd = NO;
             if (FFBShouldDropJSONItem(item, flags, &isAd)) {
                 [arr removeObjectAtIndex:(NSUInteger)i];
                 removed++;
                 if (isAd && outAdsCount) (*outAdsCount)++;
-            } else {
-                removed += FFBStripMutableJSONInPlace(item, flags, depth + 1, outAdsCount);
             }
         }
     } else if ([obj isKindOfClass:NSMutableDictionary.class]) {
         NSMutableDictionary *dict = (NSMutableDictionary *)obj;
+
+        if (flags.hideStoriesTray) {
+            for (NSString *trayKey in @[@"unified_stories_buckets", @"stories_tray", @"snacks_tray", @"stories_buckets"]) {
+                id trayVal = dict[trayKey];
+                if ([trayVal isKindOfClass:NSMutableDictionary.class]) {
+                    NSMutableDictionary *trayDict = (NSMutableDictionary *)trayVal;
+                    if ([trayDict[@"edges"] isKindOfClass:NSMutableArray.class] &&
+                        ((NSMutableArray *)trayDict[@"edges"]).count > 0) {
+                        removed += ((NSMutableArray *)trayDict[@"edges"]).count;
+                        [(NSMutableArray *)trayDict[@"edges"] removeAllObjects];
+                    }
+                    if ([trayDict[@"nodes"] isKindOfClass:NSMutableArray.class] &&
+                        ((NSMutableArray *)trayDict[@"nodes"]).count > 0) {
+                        removed += ((NSMutableArray *)trayDict[@"nodes"]).count;
+                        [(NSMutableArray *)trayDict[@"nodes"] removeAllObjects];
+                    }
+                }
+            }
+        }
+
         NSArray *keys = [dict allKeys];
         for (id k in keys) {
             id val = dict[k];
@@ -435,12 +576,11 @@ static NSUInteger FFBStripMutableJSONInPlace(id obj, const FFBFilterFlags &flags
 }
 
 static NSData *FFBFilterRCTResponseData(NSData *data) {
-    if (!data || data.length < 48 || data.length > 12 * 1024 * 1024) return data;
+    if (!data || data.length < 40 || data.length > 16 * 1024 * 1024) return data;
 
     FFBFilterFlags flags = FFBReadCurrentFilterFlags();
     if (!flags.anyJSONActive()) return data;
 
-    // Fast-path byte-scan: se la pagina non contiene alcun token sponsorizzato/PYMK, restituisci subito i byte originali!
     if (!FFBDataMayContainFilterableTokens(data, flags)) {
         return data;
     }
@@ -464,21 +604,27 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
                 [outParts addObject:part];
                 continue;
             }
-            NSData *partData = [trimmed dataUsingEncoding:NSUTF8StringEncoding];
-            if (!partData) {
-                gInsideInternalJSONPass = false;
-                return data;
+
+            BOOL hadLoopPrefix = NO;
+            NSString *jsonCandidate = trimmed;
+            if ([jsonCandidate hasPrefix:@"for (;;);"]) {
+                hadLoopPrefix = YES;
+                jsonCandidate = [jsonCandidate substringFromIndex:9];
             }
-            if (!FFBDataMayContainFilterableTokens(partData, flags)) {
+
+            NSData *partData = [jsonCandidate dataUsingEncoding:NSUTF8StringEncoding];
+            if (!partData || !FFBDataMayContainFilterableTokens(partData, flags)) {
                 [outParts addObject:part];
                 continue;
             }
+
             id json = [NSJSONSerialization JSONObjectWithData:partData
                                                       options:NSJSONReadingMutableContainers
                                                         error:nil];
             if (!json) {
-                gInsideInternalJSONPass = false;
-                return data;
+                // Mantiene intatte eventuali righe boundary/metadata senza annullare l'intero payload
+                [outParts addObject:part];
+                continue;
             }
 
             NSUInteger removedHere = FFBStripMutableJSONInPlace(json, flags, 0, &totalAds);
@@ -488,16 +634,12 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
             }
 
             NSData *reserialized = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-            if (!reserialized) {
-                gInsideInternalJSONPass = false;
-                return data;
-            }
-            NSString *reStr = [[NSString alloc] initWithData:reserialized encoding:NSUTF8StringEncoding];
+            NSString *reStr = reserialized ? [[NSString alloc] initWithData:reserialized encoding:NSUTF8StringEncoding] : nil;
             if (!reStr) {
-                gInsideInternalJSONPass = false;
-                return data;
+                [outParts addObject:part];
+                continue;
             }
-            [outParts addObject:reStr];
+            [outParts addObject:(hadLoopPrefix ? [@"for (;;);" stringByAppendingString:reStr] : reStr)];
             totalRemoved += removedHere;
         }
 
@@ -552,8 +694,8 @@ static NSData *FFBFilterRCTResponseData(NSData *data) {
 }
 
 - (BOOL)canHandleRequest:(NSURLRequest *)request {
-    return FFBIsDedicatedAdQueryName(FFBRCTExtractFriendlyName(request)) ||
-           FocusFBIsStorySeenNetworkRequest(request);
+    NSString *q = FFBRCTExtractFriendlyName(request);
+    return FFBIsDedicatedAdQueryName(q) || FocusFBIsStorySeenNetworkRequest(request);
 }
 
 - (float)handlerPriority {
@@ -693,10 +835,13 @@ static id FFBHook_RCTNetworking_handlerForRequest(id self, SEL _cmd, NSURLReques
             gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
             return [FFBBlockingRCTHandler sharedAdBlocker];
         }
+        if (prefs.hideStoriesTray && FFBIsStoriesTrayQueryName(queryName)) {
+            return [FFBBlockingRCTHandler sharedSilentSuccess];
+        }
 
         id origHandler = gOrigRCTHandlerForReq ? gOrigRCTHandlerForReq(self, _cmd, request) : nil;
         FFBFilterFlags flags = FFBReadCurrentFilterFlags();
-        if (origHandler && flags.anyJSONActive() && FFBShouldFilterRCTResponseForQuery(queryName)) {
+        if (origHandler && flags.anyJSONActive() && FFBShouldFilterRCTResponse(request, queryName)) {
             FFBFilteringRCTHandler *wrapper = [[FFBFilteringRCTHandler alloc] init];
             wrapper.innerHandler = origHandler;
             return wrapper;
@@ -708,9 +853,6 @@ static id FFBHook_RCTNetworking_handlerForRequest(id self, SEL _cmd, NSURLReques
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MOTORE 2: Pando & FBTree C++ GraphQL Model Layer (FBMemModelObject)
-// Rimuove Ads, PYMK ("Persone che potresti conoscere"), Carosello Reels,
-// Post Suggeriti e Barra Storie PRIMA che raggiungano la UICollectionView
-// (zero celle fantasma, zero scatti durante lo scroll!)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static BOOL FFBIsThreadsPromoModel(id model, Class cls) {
@@ -736,50 +878,72 @@ static BOOL FFBIsThreadsPromoModel(id model, Class cls) {
     return NO;
 }
 
-static BOOL FFBIsMarketplaceModelSponsoredViaKVC(id model) {
-    static NSArray<NSString *> *nonNullAdKeys = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        nonNullAdKeys = @[
-            @"sponsored_data",
-            @"sponsoredData",
-            @"ad_data",
-            @"adData",
-            @"boosted_marketplace_listing",
-            @"promoted_listing_info",
-            @"marketplace_ad_data"
-        ];
-    });
-
-    for (NSString *k in nonNullAdKeys) {
-        @try {
-            id v = [model valueForKey:k];
-            if (v != nil && ![v isKindOfClass:NSNull.class]) {
-                return YES;
-            }
-        } @catch (__unused NSException *e) {}
+static BOOL FFBModelInstanceHasDirectAdSignals(id obj) {
+    if (!obj) return NO;
+    Class cls = object_getClass(obj);
+    NSString *clsName = NSStringFromClass(cls) ?: @"";
+    if ([clsName containsString:@"SponsoredData"] || [clsName hasSuffix:@"AdData"]) {
+        return NO;
     }
 
-    @try {
-        id adId = [model valueForKey:@"ad_id"];
-        if ([adId isKindOfClass:NSString.class] && ((NSString *)adId).length > 0) {
-            return YES;
-        }
-    } @catch (__unused NSException *e) {}
+    if (FFBIsAdTypenameString(clsName) ||
+        [clsName containsString:@"InstreamVideoAd"] ||
+        [clsName containsString:@"VideoAdBreak"]) {
+        return YES;
+    }
 
-    @try {
-        id isSpons = [model valueForKey:@"is_sponsored"];
-        if ([isSpons isKindOfClass:NSNumber.class] && [(NSNumber *)isSpons boolValue]) {
+    SEL objAdSelectors[] = {
+        @selector(sponsoredData),
+        @selector(adData),
+        @selector(marketplaceAdData),
+        @selector(boostedMarketplaceListing),
+        @selector(promotedListingInfo),
+        @selector(adImpressionClientToken)
+    };
+    for (size_t i = 0; i < sizeof(objAdSelectors) / sizeof(objAdSelectors[0]); i++) {
+        SEL sel = objAdSelectors[i];
+        if (FFBMethodReturnsObject(cls, sel)) {
+            id val = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+            if (val != nil && ![val isKindOfClass:NSNull.class]) {
+                return YES;
+            }
+        }
+    }
+
+    SEL idSelectors[] = { @selector(adID), @selector(adId) };
+    for (size_t i = 0; i < sizeof(idSelectors) / sizeof(idSelectors[0]); i++) {
+        SEL sel = idSelectors[i];
+        if (FFBMethodReturnsObject(cls, sel)) {
+            id val = ((id (*)(id, SEL))objc_msgSend)(obj, sel);
+            if (([val isKindOfClass:NSString.class] && ((NSString *)val).length > 0) ||
+                ([val isKindOfClass:NSNumber.class] && [(NSNumber *)val longLongValue] > 0)) {
+                return YES;
+            }
+        }
+    }
+
+    SEL boolSelectors[] = { @selector(isSponsored), @selector(isAd), @selector(isBoosted) };
+    for (size_t i = 0; i < sizeof(boolSelectors) / sizeof(boolSelectors[0]); i++) {
+        SEL sel = boolSelectors[i];
+        if (FFBMethodReturnsBool(cls, sel)) {
+            if (((BOOL (*)(id, SEL))objc_msgSend)(obj, sel)) {
+                return YES;
+            }
+        }
+    }
+
+    if (FFBMethodReturnsObject(cls, @selector(tracking))) {
+        id tr = ((id (*)(id, SEL))objc_msgSend)(obj, @selector(tracking));
+        if ([tr isKindOfClass:NSString.class] && FFBTrackingStringLooksSponsored((NSString *)tr)) {
             return YES;
         }
-    } @catch (__unused NSException *e) {}
+    }
 
     return NO;
 }
 
 static BOOL FFBClassIsFeedOrCommerceCandidate(NSString *clsName) {
     if (clsName.length < 4) return NO;
-    // Non toccare mai oggetti di bootstrap/autenticazione/utente (es. FBMemViewer, FBMemUser, FBMemConfig*)
     return ([clsName containsString:@"Edge"] ||
             [clsName containsString:@"Story"] ||
             [clsName containsString:@"Stories"] ||
@@ -788,6 +952,8 @@ static BOOL FFBClassIsFeedOrCommerceCandidate(NSString *clsName) {
             [clsName containsString:@"Bucket"] ||
             [clsName containsString:@"Marketplace"] ||
             [clsName containsString:@"Commerce"] ||
+            [clsName containsString:@"ProductItem"] ||
+            [clsName containsString:@"Listing"] ||
             [clsName containsString:@"Sponsored"] ||
             [clsName containsString:@"AdBreak"] ||
             [clsName containsString:@"InstreamVideoAd"] ||
@@ -815,7 +981,6 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
     Class cls = object_getClass(model);
     NSString *clsName = NSStringFromClass(cls) ?: @"";
 
-    // Non filtrare il nodo figlio *SponsoredData* stesso, così il post padre mantiene [story sponsoredData] != nil
     if ([clsName containsString:@"SponsoredData"] || [clsName hasSuffix:@"AdData"]) {
         return NO;
     }
@@ -823,19 +988,22 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
         return NO;
     }
 
-    // 1. Controllo `category` (FBMemNewsFeedEdge, Marketplace Edges, Stories)
+    // 1. Controllo `category`
     SEL catSel = @selector(category);
     if (FFBMethodReturnsObject(cls, catSel)) {
         id rawCat = ((id (*)(id, SEL))objc_msgSend)(model, catSel);
         if ([rawCat isKindOfClass:NSString.class]) {
-            NSString *cat = (NSString *)rawCat;
+            NSString *cat = [(NSString *)rawCat uppercaseString];
             if (flags.blockAds &&
                 ([cat isEqualToString:@"SPONSORED"] ||
                  [cat isEqualToString:@"AD"] ||
                  [cat isEqualToString:@"ADS"] ||
                  [cat isEqualToString:@"MARKETPLACE_ADS"] ||
+                 [cat isEqualToString:@"MARKETPLACE_AD"] ||
                  [cat isEqualToString:@"SPONSORED_STORY"] ||
-                 [cat containsString:@"SPONSOR"])) {
+                 [cat containsString:@"SPONSOR"] ||
+                 [cat containsString:@"BOOSTED"] ||
+                 [cat containsString:@"PROMOTED"])) {
                 gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
                 return YES;
             }
@@ -860,18 +1028,20 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
             }
             if (flags.hideStoriesTray &&
                 ([cat isEqualToString:@"MULTI_FB_STORIES_TRAY"] ||
-                 [cat isEqualToString:@"STORIES_TRAY"])) {
+                 [cat isEqualToString:@"STORIES_TRAY"] ||
+                 [cat isEqualToString:@"SNACKS_TRAY"] ||
+                 [cat isEqualToString:@"FB_STORIES"])) {
                 return YES;
             }
         }
     }
 
-    // 2. Controllo `storyBucketType` (Ads, PYMK e Suggeriti dentro la riga Storie!)
+    // 2. Controllo `storyBucketType`
     SEL bucketSel = @selector(storyBucketType);
     if (FFBMethodReturnsObject(cls, bucketSel)) {
         id bucket = ((id (*)(id, SEL))objc_msgSend)(model, bucketSel);
         if ([bucket isKindOfClass:NSString.class]) {
-            NSString *bStr = (NSString *)bucket;
+            NSString *bStr = [(NSString *)bucket uppercaseString];
             if (flags.blockAds &&
                 ([bStr isEqualToString:@"ADS"] ||
                  [bStr isEqualToString:@"AD"] ||
@@ -895,54 +1065,37 @@ static BOOL FFBShouldFilterGraphQLModel(id model) {
         }
     }
 
-    // 3. Controllo `sponsoredData`, `isSponsored` e classi Ad
+    // 3. Controllo barra Storie
+    if (flags.hideStoriesTray && FFBIsStoriesTrayTypenameString(clsName)) {
+        return YES;
+    }
+
+    // 4. Controllo Ads su `model` e sui suoi figli diretti (`node`, `listing`, `story`)
     if (flags.blockAds) {
-        SEL sponsSel = @selector(sponsoredData);
-        if (FFBMethodReturnsObject(cls, sponsSel)) {
-            id sData = ((id (*)(id, SEL))objc_msgSend)(model, sponsSel);
-            if (sData != nil && ![sData isKindOfClass:NSNull.class]) {
-                gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-                return YES;
-            }
-        }
-
-        SEL isSponsSel = @selector(isSponsored);
-        if (FFBMethodReturnsBool(cls, isSponsSel)) {
-            BOOL flag = ((BOOL (*)(id, SEL))objc_msgSend)(model, isSponsSel);
-            if (flag) {
-                gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-                return YES;
-            }
-        }
-
-        if (FFBIsAdTypenameString(clsName) ||
-            [clsName containsString:@"InstreamVideoAd"] ||
-            [clsName containsString:@"VideoAdBreak"]) {
+        if (FFBModelInstanceHasDirectAdSignals(model)) {
             gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
             return YES;
         }
-
-        if ([clsName containsString:@"Marketplace"] ||
-            [clsName containsString:@"GroupCommerce"] ||
-            [clsName containsString:@"CommerceProduct"]) {
-            if (FFBIsMarketplaceModelSponsoredViaKVC(model)) {
-                gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
-                return YES;
+        SEL childSels[] = { @selector(node), @selector(listing), @selector(story) };
+        for (size_t i = 0; i < sizeof(childSels) / sizeof(childSels[0]); i++) {
+            SEL cSel = childSels[i];
+            if (FFBMethodReturnsObject(cls, cSel)) {
+                id child = ((id (*)(id, SEL))objc_msgSend)(model, cSel);
+                if (child && FFBModelInstanceHasDirectAdSignals(child)) {
+                    gBlockedAdsCount.fetch_add(1, std::memory_order_relaxed);
+                    return YES;
+                }
             }
         }
     }
 
-    // 4. Rimozione "Persone che potresti conoscere" (PYMK)
+    // 5. PYMK, Carosello Reels e Suggeriti
     if (flags.hidePYMK && FFBIsPYMKTypenameString(clsName)) {
         return YES;
     }
-
-    // 5. Rimozione Carosello Reels nel Feed
     if (flags.hideReelsCarousel && FFBIsReelsCarouselTypenameString(clsName)) {
         return YES;
     }
-
-    // 6. Rimozione Gruppi, Pagine consigliate, Storie singole suggerite e Promo Threads
     if (flags.hideSuggested) {
         if (FFBIsSuggestedTypenameString(clsName)) {
             return YES;
@@ -990,11 +1143,11 @@ static void *FFBHook_initWithFBTree(void *rawSelf, SEL _cmd, void *tree) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MOTORE 3: NSJSONSerialization Pruner (Bloks / Relay Nativo fuori da RCTNetworking)
+// MOTORE 3: NSJSONSerialization Pruner Bottom-Up (Bloks / Relay Nativo)
 // ─────────────────────────────────────────────────────────────────────────────
 
 static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilterFlags &flags, NSUInteger depth, BOOL *outChanged) {
-    if (!obj || depth > 20) return obj;
+    if (!obj || depth > 22) return obj;
 
     if ([obj isKindOfClass:NSArray.class]) {
         NSArray *arr = (NSArray *)obj;
@@ -1004,9 +1157,13 @@ static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilte
         NSMutableArray *cleaned = nil;
 
         for (NSUInteger i = 0; i < arr.count; i++) {
-            id item = arr[i];
+            id origItem = arr[i];
+            BOOL childChanged = NO;
+            id itemAfterChildPass = FFBPruneItemsInJSONNode(origItem, mutableContainers, flags, depth + 1, &childChanged);
+            id candidate = childChanged ? (itemAfterChildPass ?: origItem) : origItem;
+
             BOOL isAd = NO;
-            if (FFBShouldDropJSONItem(item, flags, &isAd)) {
+            if (FFBShouldDropJSONItem(candidate, flags, &isAd)) {
                 if (!localChanged) {
                     localChanged = YES;
                     cleaned = [NSMutableArray arrayWithCapacity:arr.count];
@@ -1020,8 +1177,6 @@ static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilte
                 continue;
             }
 
-            BOOL childChanged = NO;
-            id newItem = FFBPruneItemsInJSONNode(item, mutableContainers, flags, depth + 1, &childChanged);
             if (childChanged && !localChanged) {
                 localChanged = YES;
                 cleaned = [NSMutableArray arrayWithCapacity:arr.count];
@@ -1030,7 +1185,7 @@ static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilte
                 }
             }
             if (localChanged) {
-                [cleaned addObject:(newItem ?: item)];
+                [cleaned addObject:candidate];
             }
         }
 
@@ -1050,6 +1205,22 @@ static id FFBPruneItemsInJSONNode(id obj, BOOL mutableContainers, const FFBFilte
 
         for (id key in dict) {
             id val = dict[key];
+            if (flags.hideStoriesTray && [key isKindOfClass:NSString.class]) {
+                NSString *ks = (NSString *)key;
+                if (([ks isEqualToString:@"unified_stories_buckets"] ||
+                     [ks isEqualToString:@"stories_tray"] ||
+                     [ks isEqualToString:@"snacks_tray"]) &&
+                    [val isKindOfClass:NSDictionary.class]) {
+                    NSMutableDictionary *emptyTray = [(NSDictionary *)val mutableCopy];
+                    if ([emptyTray[@"edges"] isKindOfClass:NSArray.class] && ((NSArray *)emptyTray[@"edges"]).count > 0) {
+                        emptyTray[@"edges"] = mutableContainers ? [NSMutableArray array] : @[];
+                        if (!localChanged) { localChanged = YES; mutDict = [dict mutableCopy]; }
+                        mutDict[key] = mutableContainers ? emptyTray : [emptyTray copy];
+                        continue;
+                    }
+                }
+            }
+
             if (![val isKindOfClass:NSArray.class] && ![val isKindOfClass:NSDictionary.class]) {
                 continue;
             }
@@ -1084,7 +1255,6 @@ static id FFBHook_JSONObjectWithData(id self,
         return parsed;
     }
 
-    // Filtra esclusivamente payload radice GraphQL (mai MobileConfig o file di configurazione)
     if (![parsed isKindOfClass:NSDictionary.class]) return parsed;
     NSDictionary *rootDict = (NSDictionary *)parsed;
     if (!rootDict[@"data"] && !rootDict[@"label"] && !rootDict[@"edges"]) {
@@ -1093,7 +1263,7 @@ static id FFBHook_JSONObjectWithData(id self,
 
     FFBFilterFlags flags = FFBReadCurrentFilterFlags();
     if (!flags.anyJSONActive()) return parsed;
-    if (data.length < 64 || data.length > 8 * 1024 * 1024) return parsed;
+    if (data.length < 48 || data.length > 10 * 1024 * 1024) return parsed;
     if (!FFBDataMayContainFilterableTokens(data, flags)) return parsed;
 
     @try {
@@ -1106,7 +1276,7 @@ static id FFBHook_JSONObjectWithData(id self,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Installazione Hook AdBlock & Feed Cleanup (Immediata + Dyld Lazy Listener)
+// Installazione Immediata Post-Launch + Aggancio Rapido per Framework Lazy
 // ─────────────────────────────────────────────────────────────────────────────
 
 static void FFBInstallAvailableAdHooksNow(void) {
@@ -1166,36 +1336,19 @@ void FocusFBRetryLazyAdHooksIfNeeded(void) {
     }
 }
 
-static void FFBActivateAdBlockerAfterBecomeActive(void) {
+void FocusFBInstallAdBlocker(void) {
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
         FFBInstallAvailableAdHooksNow();
         gAdBlockerReady.store(true, std::memory_order_relaxed);
 
-        // Ritenta pigramente sul main thread per framework React Native caricati dopo il login/apertura tab
-        for (NSNumber *delaySec in @[@(1.5), @(4.0), @(8.0)]) {
+        // Intervalli ravvicinati fin dai primi 50ms per intercettare la prima query di Marketplace all'avvio
+        NSArray<NSNumber *> *delays = @[@(0.05), @(0.15), @(0.40), @(0.90), @(2.0), @(4.5), @(8.0)];
+        for (NSNumber *delaySec in delays) {
             double d = delaySec.doubleValue;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 FFBInstallAvailableAdHooksNow();
             });
         }
-    });
-}
-
-void FocusFBInstallAdBlocker(void) {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
-                                                          object:nil
-                                                           queue:[NSOperationQueue mainQueue]
-                                                      usingBlock:^(__unused NSNotification *note) {
-            FFBActivateAdBlockerAfterBecomeActive();
-        }];
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (UIApplication.sharedApplication.applicationState == UIApplicationStateActive) {
-                FFBActivateAdBlockerAfterBecomeActive();
-            }
-        });
     });
 }

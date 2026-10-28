@@ -32,10 +32,14 @@ static char kBarLongPressKey;
 static char kWindowTwoFingerKey;
 static char kCachedBarPassKey;
 static char kCachedVCBarsKey;
+static char kIsHomeFeedCollectionKey;
+static char kHiddenByFocusFBCellKey;
+static char kStoriesSectionZeroKey;
 
 typedef void (*FFBLayoutIMP)(id, SEL);
-typedef void (*FFBViewDidAppearIMP)(id, SEL, BOOL);
+typedef void (*FFBViewAppearIMP)(id, SEL, BOOL);
 typedef void (*FFBOffsetFractionIMP)(id, SEL, double, NSUInteger);
+typedef CGSize (*FFBCollectionSizeForItemIMP)(id, SEL, UICollectionView *, UICollectionViewLayout *, NSIndexPath *);
 
 static FFBLayoutIMP gOrigFloatingBarLayout      = NULL;
 static FFBLayoutIMP gOrigNativeGlassBarLayout   = NULL;
@@ -45,8 +49,11 @@ static FFBLayoutIMP gOrigLegacyItemLayout       = NULL;
 static FFBLayoutIMP gOrigUITabBarLayout         = NULL;
 static FFBLayoutIMP gOrigTabBarVCLayout         = NULL;
 static FFBLayoutIMP gOrigTabAndContentVCLayout  = NULL;
+static FFBLayoutIMP gOrigCollectionViewLayout   = NULL;
 static FFBOffsetFractionIMP gOrigSetOffsetFrac  = NULL;
-static FFBViewDidAppearIMP gOrigVCViewDidAppear = NULL;
+static FFBViewAppearIMP gOrigVCViewWillAppear   = NULL;
+static FFBViewAppearIMP gOrigVCViewDidAppear    = NULL;
+static FFBCollectionSizeForItemIMP gOrigFBCompSizeForItem = NULL;
 
 static BOOL gHooksInstalledFloatingBar      = NO;
 static BOOL gHooksInstalledNativeGlassBar   = NO;
@@ -57,7 +64,10 @@ static BOOL gHooksInstalledUITabBar         = NO;
 static BOOL gHooksInstalledTabBarVC         = NO;
 static BOOL gHooksInstalledTabAndContentVC  = NO;
 static BOOL gHooksInstalledOffsetFraction   = NO;
+static BOOL gHooksInstalledVCWillAppear     = NO;
 static BOOL gHooksInstalledVC               = NO;
+static BOOL gHooksInstalledCollectionLayout = NO;
+static BOOL gHooksInstalledFBCompSize       = NO;
 
 static BOOL gIsReflowingNavbar = NO;
 static BOOL gForceFullScreenSingleBar = NO;
@@ -1592,17 +1602,209 @@ static BOOL FFBIsReelsOrWatchControllerName(NSString *clsName) {
             [lower containsString:@"fbtahoe"]);
 }
 
-static void FFBHideInlineStoriesAndReelsViews(UIView *root, NSUInteger depth) {
-    if (!root || depth > 8) return;
-    NSString *cls = NSStringFromClass(object_getClass(root)).lowercaseString;
-    if ([cls containsString:@"storiestray"] ||
-        [cls containsString:@"inlinesnacks"] ||
-        [cls containsString:@"reelshscroll"] ||
-        [cls containsString:@"reelsunit"]) {
-        root.hidden = YES;
-        root.alpha = 0.0;
-        return;
+static BOOL FFBSubtreeMatchesStoriesOrReels(UIView *node,
+                                            NSUInteger depth,
+                                            BOOL checkStories,
+                                            BOOL checkReels,
+                                            BOOL allowTopTrayHeuristics) {
+    if (!node || depth > 16) return NO;
+    NSString *cls = NSStringFromClass(object_getClass(node)).lowercaseString ?: @"";
+
+    if (checkStories) {
+        if ([cls containsString:@"snackstray"] ||
+            [cls containsString:@"fbsnacks"] ||
+            [cls containsString:@"storiestray"] ||
+            [cls containsString:@"storytray"] ||
+            [cls containsString:@"inlinesnacks"] ||
+            [cls containsString:@"storiesring"] ||
+            [cls containsString:@"storybucket"]) {
+            return YES;
+        }
+        if (allowTopTrayHeuristics) {
+            NSString *axLabel = node.accessibilityLabel.lowercaseString;
+            NSString *axId = node.accessibilityIdentifier.lowercaseString;
+            if ((axLabel.length > 0 &&
+                 ([axLabel containsString:@"crea storia"] ||
+                  [axLabel containsString:@"crea una storia"] ||
+                  [axLabel containsString:@"la tua storia"] ||
+                  [axLabel containsString:@"aggiungi alla storia"] ||
+                  [axLabel containsString:@"create story"] ||
+                  [axLabel containsString:@"create a story"] ||
+                  [axLabel containsString:@"your story"] ||
+                  [axLabel containsString:@"add to story"])) ||
+                (axId.length > 0 &&
+                 ([axId containsString:@"stories_tray"] ||
+                  [axId containsString:@"snacks_tray"] ||
+                  [axId containsString:@"story_tray"]))) {
+                return YES;
+            }
+            if ([node isKindOfClass:UIScrollView.class] && depth >= 1) {
+                UIScrollView *sv = (UIScrollView *)node;
+                CGFloat h = CGRectGetHeight(sv.bounds);
+                CGFloat w = CGRectGetWidth(sv.bounds);
+                if (w >= 240.0 && h >= 135.0 && h <= 265.0 &&
+                    (sv.alwaysBounceHorizontal || sv.contentSize.width > w * 1.15) &&
+                    !sv.alwaysBounceVertical) {
+                    // Verifica che contenga almeno 2 card verticali formato Storia (~9:16, larghezza 80..142pt)
+                    int storyPortraitCards = 0;
+                    for (UIView *child in sv.subviews) {
+                        if (child.hidden || child.alpha <= 0.05) continue;
+                        CGFloat cw = CGRectGetWidth(child.frame);
+                        CGFloat ch = CGRectGetHeight(child.frame);
+                        if (cw >= 76.0 && cw <= 145.0 && ch >= 130.0 && ch <= 255.0 && ch >= cw * 1.22) {
+                            storyPortraitCards++;
+                        } else {
+                            for (UIView *grand in child.subviews) {
+                                CGFloat gw = CGRectGetWidth(grand.frame);
+                                CGFloat gh = CGRectGetHeight(grand.frame);
+                                if (gw >= 76.0 && gw <= 145.0 && gh >= 130.0 && gh <= 255.0 && gh >= gw * 1.22) {
+                                    storyPortraitCards++;
+                                    break;
+                                }
+                            }
+                        }
+                        if (storyPortraitCards >= 2) return YES;
+                    }
+                }
+            }
+        }
     }
+
+    if (checkReels) {
+        if ([cls containsString:@"reelshscroll"] ||
+            [cls containsString:@"reelsunit"] ||
+            [cls containsString:@"fbshorts"] ||
+            [cls containsString:@"shortformvideo"]) {
+            return YES;
+        }
+    }
+
+    for (UIView *sub in node.subviews) {
+        if (FFBSubtreeMatchesStoriesOrReels(sub, depth + 1, checkStories, checkReels, allowTopTrayHeuristics)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static void FFBSetViewHiddenSymmetrically(UIView *v, BOOL shouldHide) {
+    if (!v) return;
+    if (shouldHide) {
+        v.hidden = YES;
+        v.alpha = 0.0;
+        v.userInteractionEnabled = NO;
+        objc_setAssociatedObject(v, &kHiddenByFocusFBCellKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if ([objc_getAssociatedObject(v, &kHiddenByFocusFBCellKey) boolValue]) {
+        v.hidden = NO;
+        v.alpha = 1.0;
+        v.userInteractionEnabled = YES;
+        objc_setAssociatedObject(v, &kHiddenByFocusFBCellKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static BOOL FFBCollectionViewBelongsToHomeFeed(UICollectionView *cv) {
+    if (!cv) return NO;
+    NSNumber *cached = objc_getAssociatedObject(cv, &kIsHomeFeedCollectionKey);
+    if (cached != nil) {
+        return cached.boolValue;
+    }
+
+    // Solo collezioni verticali principali del Feed Home (mai caroselli interni o Marketplace)
+    if (cv.alwaysBounceHorizontal && !cv.alwaysBounceVertical) {
+        objc_setAssociatedObject(cv, &kIsHomeFeedCollectionKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return NO;
+    }
+
+    UIResponder *resp = cv.nextResponder;
+    int hops = 0;
+    BOOL isHome = NO;
+    BOOL sawController = NO;
+    while (resp && hops < 12) {
+        if ([resp isKindOfClass:UIViewController.class]) {
+            sawController = YES;
+            NSString *vcCls = NSStringFromClass(((UIViewController *)resp).class) ?: @"";
+            NSString *lower = vcCls.lowercaseString;
+            if ([lower containsString:@"marketplace"] ||
+                [lower containsString:@"snacksviewer"] ||
+                [lower containsString:@"reels"]) {
+                isHome = NO;
+                break;
+            }
+            if (FFBIsHomeFeedControllerName(vcCls)) {
+                isHome = YES;
+                break;
+            }
+        }
+        resp = resp.nextResponder;
+        hops++;
+    }
+
+    if (sawController) {
+        objc_setAssociatedObject(cv, &kIsHomeFeedCollectionKey, @(isHome), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return isHome;
+}
+
+static void FFBFilterHomeFeedCollectionCells(UICollectionView *cv, BOOL hideStories, BOOL hideReels) {
+    if (!cv) return;
+    BOOL storiesAtZero = NO;
+    for (UICollectionViewCell *cell in cv.visibleCells) {
+        BOOL nearFeedTop = (CGRectGetMinY(cell.frame) < 340.0 && CGRectGetHeight(cell.frame) <= 320.0);
+        BOOL match = (hideStories || hideReels) &&
+                     FFBSubtreeMatchesStoriesOrReels(cell, 0, hideStories, hideReels, nearFeedTop);
+        FFBSetViewHiddenSymmetrically(cell, match);
+        if (match && hideStories && nearFeedTop) {
+            NSIndexPath *ip = [cv indexPathForCell:cell];
+            if (ip && ip.section == 0 && ip.item == 0) {
+                storiesAtZero = YES;
+            }
+        }
+    }
+    if (storiesAtZero) {
+        objc_setAssociatedObject(cv, &kStoriesSectionZeroKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if (!hideStories) {
+        objc_setAssociatedObject(cv, &kStoriesSectionZeroKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+
+    // Controlla anche eventuali header UICollectionReusableView sopra le celle
+    for (UIView *sub in cv.subviews) {
+        if ([sub isKindOfClass:UICollectionViewCell.class]) continue;
+        if (CGRectGetMinY(sub.frame) < 320.0 && CGRectGetHeight(sub.frame) >= 80.0 && CGRectGetHeight(sub.frame) <= 320.0) {
+            BOOL hdrMatch = (hideStories || hideReels) &&
+                            FFBSubtreeMatchesStoriesOrReels(sub, 0, hideStories, hideReels, YES);
+            FFBSetViewHiddenSymmetrically(sub, hdrMatch);
+        }
+    }
+}
+
+static void FFBHideInlineStoriesAndReelsViews(UIView *root, NSUInteger depth) {
+    if (!root || depth > 14) return;
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    BOOL hideStories = prefs.enabled && prefs.hideStoriesTray;
+    BOOL hideReels   = prefs.enabled && prefs.hideReelsCarousel;
+
+    if ([root isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)root;
+        if (FFBCollectionViewBelongsToHomeFeed(cv)) {
+            FFBFilterHomeFeedCollectionCells(cv, hideStories, hideReels);
+            return;
+        }
+    }
+
+    NSString *cls = NSStringFromClass(object_getClass(root)).lowercaseString ?: @"";
+    BOOL matchDirect = (hideStories && ([cls containsString:@"snackstray"] ||
+                                        [cls containsString:@"storiestray"] ||
+                                        [cls containsString:@"storytray"] ||
+                                        [cls containsString:@"inlinesnacks"])) ||
+                       (hideReels && ([cls containsString:@"reelshscroll"] ||
+                                      [cls containsString:@"reelsunit"]));
+    if (matchDirect) {
+        FFBSetViewHiddenSymmetrically(root, YES);
+        return;
+    } else {
+        FFBSetViewHiddenSymmetrically(root, NO);
+    }
+
     for (UIView *sub in root.subviews) {
         FFBHideInlineStoriesAndReelsViews(sub, depth + 1);
     }
@@ -1663,8 +1865,8 @@ static void FFBApplyControllerProtection(UIViewController *vc) {
         [existingReelsShield removeFromSuperview];
     }
 
-    // 3. Storie e caroselli Reels inline (solo sul Feed Home, mai su Marketplace!)
-    if (prefs.enabled && (prefs.hideStoriesTray || prefs.hideReelsCarousel) && FFBIsHomeFeedControllerName(clsName)) {
+    // 3. Storie e caroselli Reels inline (solo sul Feed Home, con ripristino simmetrico se disattivato!)
+    if (FFBIsHomeFeedControllerName(clsName)) {
         FFBHideInlineStoriesAndReelsViews(v, 0);
     }
 }
@@ -1776,6 +1978,55 @@ static void FFBHook_setTabBarViewOffsetFraction(id self, SEL _cmd, double fracti
     }
 }
 
+static void FFBHook_UICollectionView_layoutSubviews(id self, SEL _cmd) {
+    if (gOrigCollectionViewLayout) gOrigCollectionViewLayout(self, _cmd);
+
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    if (!prefs.enabled) return;
+
+    UICollectionView *cv = (UICollectionView *)self;
+    if (!FFBCollectionViewBelongsToHomeFeed(cv)) {
+        return; // O(1) immediato su Marketplace e su tutte le altre schermate!
+    }
+    FFBFilterHomeFeedCollectionCells(cv, prefs.hideStoriesTray, prefs.hideReelsCarousel);
+}
+
+static CGSize FFBHook_FBCompDataSource_sizeForItem(id self,
+                                                   SEL _cmd,
+                                                   UICollectionView *collectionView,
+                                                   UICollectionViewLayout *layout,
+                                                   NSIndexPath *indexPath) {
+    CGSize orig = gOrigFBCompSizeForItem
+                  ? gOrigFBCompSizeForItem(self, _cmd, collectionView, layout, indexPath)
+                  : CGSizeZero;
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    if (prefs.enabled && prefs.hideStoriesTray && indexPath &&
+        indexPath.section == 0 && indexPath.item == 0 &&
+        collectionView && FFBCollectionViewBelongsToHomeFeed(collectionView)) {
+        if ([objc_getAssociatedObject(collectionView, &kStoriesSectionZeroKey) boolValue] &&
+            orig.height >= 90.0 && orig.height <= 320.0) {
+            return CGSizeMake(orig.width, 0.5);
+        }
+    }
+    return orig;
+}
+
+static void FFBHook_VC_viewWillAppear(id self, SEL _cmd, BOOL animated) {
+    if (gOrigVCViewWillAppear) gOrigVCViewWillAppear(self, _cmd, animated);
+
+    UIViewController *vc = (UIViewController *)self;
+    // Aggancia subito RCTNetworking / Pando / FBSnacks PRIMA che il controller invii query GraphQL!
+    FFBInstallDynamicHooksAvailableNow();
+    FocusFBRetryLazyAdHooksIfNeeded();
+    FocusFBNotifyStoryCandidateController(vc);
+    FocusFBNotifyMediaControllerTransition(vc);
+
+    NSString *clsName = NSStringFromClass(vc.class) ?: @"";
+    if (FFBIsHomeFeedControllerName(clsName)) {
+        FFBApplyControllerProtection(vc);
+    }
+}
+
 static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     if (gOrigVCViewDidAppear) gOrigVCViewDidAppear(self, _cmd, animated);
 
@@ -1786,6 +2037,7 @@ static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
     FFBInstallDynamicHooksAvailableNow();
     FocusFBRetryLazyAdHooksIfNeeded();
     FocusFBNotifyStoryCandidateController(vc);
+    FocusFBNotifyMediaControllerTransition(vc);
 
     if ([clsName hasPrefix:@"FB"] || [clsName hasPrefix:@"META"] ||
         [clsName hasPrefix:@"MDS"] || [clsName hasPrefix:@"CDS"] ||
@@ -1843,11 +2095,33 @@ static BOOL FFBHookSpecificClassMethod(Class cls, SEL sel, IMP newIMP, IMP *orig
 }
 
 static void FFBInstallDynamicHooksAvailableNow(void) {
+    if (!gHooksInstalledVCWillAppear) {
+        gHooksInstalledVCWillAppear = FFBHookSpecificClassMethod(UIViewController.class,
+                                                                 @selector(viewWillAppear:),
+                                                                 (IMP)FFBHook_VC_viewWillAppear,
+                                                                 (IMP *)&gOrigVCViewWillAppear);
+    }
     if (!gHooksInstalledVC) {
         gHooksInstalledVC = FFBHookSpecificClassMethod(UIViewController.class,
                                                        @selector(viewDidAppear:),
                                                        (IMP)FFBHook_VC_viewDidAppear,
                                                        (IMP *)&gOrigVCViewDidAppear);
+    }
+    if (!gHooksInstalledCollectionLayout) {
+        gHooksInstalledCollectionLayout = FFBHookSpecificClassMethod(UICollectionView.class,
+                                                                     @selector(layoutSubviews),
+                                                                     (IMP)FFBHook_UICollectionView_layoutSubviews,
+                                                                     (IMP *)&gOrigCollectionViewLayout);
+    }
+    if (!gHooksInstalledFBCompSize) {
+        Class compDS = NSClassFromString(@"FBComponentCollectionViewDataSource");
+        SEL sizeSel = @selector(collectionView:layout:sizeForItemAtIndexPath:);
+        if (compDS && [compDS instancesRespondToSelector:sizeSel]) {
+            gHooksInstalledFBCompSize = FFBHookSpecificClassMethod(compDS,
+                                                                   sizeSel,
+                                                                   (IMP)FFBHook_FBCompDataSource_sizeForItem,
+                                                                   (IMP *)&gOrigFBCompSizeForItem);
+        }
     }
     if (!gHooksInstalledFloatingBar) {
         Class cls = NSClassFromString(kFloatingBarClassName);

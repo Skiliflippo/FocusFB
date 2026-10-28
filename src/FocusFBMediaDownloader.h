@@ -8,11 +8,14 @@ NS_ASSUME_NONNULL_BEGIN
 extern "C" {
 #endif
 
-/// Installa il sistema di download media (pressione prolungata + pulsante rapido su Reels/Video/Storie)
+/// Installa il downloader per Video, Reels e Storie Video (integrato nel menu Condividi di Facebook)
 void FocusFBInstallMediaDownloader(void);
 
-/// Aggiorna visibilità della scorciatoia su finestra e del pulsante download rapido
+/// Aggiorna il pulsante "Scarica video" nel menu Condividi / Opzioni e l'eventuale icona rapida
 void FocusFBMediaDownloaderSyncUI(void);
+
+/// Notifica la comparsa imminente o completata di un UIViewController (es. menu Condividi / BottomSheet)
+void FocusFBNotifyMediaControllerTransition(UIViewController * _Nullable vc);
 
 #ifdef __cplusplus
 }
