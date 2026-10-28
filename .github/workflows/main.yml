@@ -59,7 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           ZIP_CANDIDATE=""
-          for f in FocusFB-Repo-v2.5.1.zip FocusFB-Repo-v2.5.zip FocusFB-Repo*.zip; do
+          for f in FocusFB-Repo-v2.6.zip FocusFB-Repo-v2.5.1.zip FocusFB-Repo*.zip; do
             if [[ -f "$f" ]]; then
               ZIP_CANDIDATE="$f"
               break
@@ -68,7 +68,7 @@ jobs:
 
           if [[ -n "$ZIP_CANDIDATE" ]]; then
             echo "Trovato $ZIP_CANDIDATE: estrazione file puliti e rimozione vecchi zip..."
-            CLEAN_TMP="$RUNNER_TEMP/clean_repo_v25"
+            CLEAN_TMP="$RUNNER_TEMP/clean_repo_v26"
             rm -rf "$CLEAN_TMP"
             mkdir -p "$CLEAN_TMP"
             unzip -q -o "$ZIP_CANDIDATE" -d "$CLEAN_TMP"
@@ -86,7 +86,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add -A
             if ! git diff --cached --quiet; then
-              git commit -m "FocusFB v2.5.1: fix launch crash & clean open-source repository"
+              git commit -m "FocusFB v2.6: video share-sheet downloader, Marketplace ad-block & Stories bar fix"
               if [[ "${GITHUB_REF}" == refs/heads/* ]]; then
                 git push origin "HEAD:${GITHUB_REF_NAME}"
                 echo "Repository ripulito e aggiornato automaticamente su GitHub!"
@@ -227,8 +227,8 @@ jobs:
         if: ${{ startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_public_release == true) }}
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.5.0' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'FocusFB v2.5.0' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'v2.6.0' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'FocusFB v2.6.0' }}
           files: |
             dist/FocusFB.dylib
             dist/*.deb
