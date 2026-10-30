@@ -29,6 +29,7 @@
 @end
 
 @protocol FFBRCTURLRequestDelegate <NSObject>
+@optional
 - (void)URLRequest:(id)requestToken didReceiveResponse:(NSURLResponse *)response;
 - (void)URLRequest:(id)requestToken didReceiveData:(NSData *)data;
 - (void)URLRequest:(id)requestToken didCompleteWithError:(nullable NSError *)error;
@@ -762,6 +763,12 @@ static NSMutableSet *FFBLiveRCTDelegates(void) {
 
 - (id)forwardingTargetForSelector:(__unused SEL)aSelector {
     return self.realDelegate;
+}
+
+- (void)URLRequest:(id)requestToken didReceiveResponse:(NSURLResponse *)response {
+    if ([self.realDelegate respondsToSelector:@selector(URLRequest:didReceiveResponse:)]) {
+        [self.realDelegate URLRequest:requestToken didReceiveResponse:response];
+    }
 }
 
 - (void)URLRequest:(__unused id)requestToken didReceiveData:(NSData *)data {

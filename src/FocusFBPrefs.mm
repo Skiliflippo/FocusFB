@@ -305,12 +305,6 @@ static NSDictionary<NSString *, NSString *> *FFBEnglishStrings(void) {
             @"DL.SavedVideo": @"Video saved to Photos",
             @"DL.Failed": @"Could not download this video",
             @"DL.NotFound": @"Let the Reel play for a moment and retry",
-            @"DL.SaveVideo": @"Save Video to Photos",
-            @"DL.Share": @"Share video file...",
-            @"DL.Downloading": @"Downloading video...",
-            @"DL.SavedVideo": @"Video saved to Photos",
-            @"DL.Failed": @"Could not download this video",
-            @"DL.NotFound": @"Play the video briefly and try again",
 
             @"Preset.MarketplaceOnly": @"Marketplace only",
             @"Preset.MarketplaceOnlyDesc": @"Keeps only full-screen Marketplace and blocks Feed and Reels.",
