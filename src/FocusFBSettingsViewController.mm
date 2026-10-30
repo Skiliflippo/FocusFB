@@ -488,14 +488,11 @@ static NSString *FFBFormatMinutesBadge(NSInteger mins) {
 
     self.adBlockItems = @[ adBlockItem, pymkItem, reelsCarouselItem, suggestedItem, storiesTrayItem ];
 
-    // ── Download Video & Storie in Incognito ──
+    // ── Download Reels & Storie in Incognito ──
     self.mediaPrivacyItems = @[
         FFBBoolItem(@"Media.EnableDownload", @"Media.EnableDownloadDesc", @"arrow.down.circle.fill", [UIColor systemBlueColor],
                     ^BOOL(FocusFBPrefs *p) { return p.enableMediaDownload; },
                     ^(FocusFBPrefs *p, BOOL v) { p.enableMediaDownload = v; }),
-        FFBBoolItem(@"Media.ShowButton", @"Media.ShowButtonDesc", @"arrow.down.to.line.circle.fill", [UIColor systemCyanColor],
-                    ^BOOL(FocusFBPrefs *p) { return p.showMediaDownloadButton; },
-                    ^(FocusFBPrefs *p, BOOL v) { p.showMediaDownloadButton = v; }),
         FFBBoolItem(@"Stories.Incognito", @"Stories.IncognitoDesc", @"eye.slash.circle.fill", [UIColor systemPurpleColor],
                     ^BOOL(FocusFBPrefs *p) { return p.storiesIncognitoMode; },
                     ^(FocusFBPrefs *p, BOOL v) { p.storiesIncognitoMode = v; })

@@ -8,6 +8,7 @@
 
 #import <AVFoundation/AVFoundation.h>
 #import <QuartzCore/QuartzCore.h>
+#import <UIKit/UIGestureRecognizerSubclass.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 
@@ -24,8 +25,14 @@ static const NSInteger kReelsShieldTag = 0x70C502;
 static const NSInteger kFloatingBtnTag = 0x70C503;
 static const NSInteger kTimerPillTag   = 0xFFBF09;
 
-static char kOrigFrameKey;
+static char kOrigCenterKey;
+static char kOrigBoundsSizeKey;
 static char kOrigIndexKey;
+static char kBarCanonicalSlotMapKey;
+static char kBarTappedTypeKey;
+static char kBarTappedTimeKey;
+static char kBarLastKnownActiveTypeKey;
+static char kItemTouchTrackerKey;
 static char kContextDelegateKey;
 static char kContextInteractionKey;
 static char kBarLongPressKey;
@@ -43,6 +50,7 @@ typedef CGSize (*FFBCollectionSizeForItemIMP)(id, SEL, UICollectionView *, UICol
 
 static FFBLayoutIMP gOrigFloatingBarLayout      = NULL;
 static FFBLayoutIMP gOrigNativeGlassBarLayout   = NULL;
+static FFBLayoutIMP gOrigPlatterViewLayout      = NULL;
 static FFBLayoutIMP gOrigLegacyBarLayout        = NULL;
 static FFBLayoutIMP gOrigFloatingItemLayout     = NULL;
 static FFBLayoutIMP gOrigLegacyItemLayout       = NULL;
@@ -50,6 +58,7 @@ static FFBLayoutIMP gOrigUITabBarLayout         = NULL;
 static FFBLayoutIMP gOrigTabBarVCLayout         = NULL;
 static FFBLayoutIMP gOrigTabAndContentVCLayout  = NULL;
 static FFBLayoutIMP gOrigCollectionViewLayout   = NULL;
+static FFBLayoutIMP gOrigScrollViewLayout       = NULL;
 static FFBOffsetFractionIMP gOrigSetOffsetFrac  = NULL;
 static FFBViewAppearIMP gOrigVCViewWillAppear   = NULL;
 static FFBViewAppearIMP gOrigVCViewDidAppear    = NULL;
@@ -57,6 +66,7 @@ static FFBCollectionSizeForItemIMP gOrigFBCompSizeForItem = NULL;
 
 static BOOL gHooksInstalledFloatingBar      = NO;
 static BOOL gHooksInstalledNativeGlassBar   = NO;
+static BOOL gHooksInstalledPlatterView      = NO;
 static BOOL gHooksInstalledLegacyBar        = NO;
 static BOOL gHooksInstalledFloatingItem     = NO;
 static BOOL gHooksInstalledLegacyItem       = NO;
@@ -67,6 +77,7 @@ static BOOL gHooksInstalledOffsetFraction   = NO;
 static BOOL gHooksInstalledVCWillAppear     = NO;
 static BOOL gHooksInstalledVC               = NO;
 static BOOL gHooksInstalledCollectionLayout = NO;
+static BOOL gHooksInstalledScrollLayout     = NO;
 static BOOL gHooksInstalledFBCompSize       = NO;
 
 static BOOL gIsReflowingNavbar = NO;
@@ -93,6 +104,11 @@ static void FFBAttachLongPressToBar(UIView *bar);
 static void FFBAttachWindowShortcuts(UIWindow *window);
 static void FFBSyncFloatingGearButton(UIWindow *window);
 static void FFBReevaluateVisibleControllers(void);
+static void FFBStartNavbarPillSyncBurst(void);
+static BOOL FFBControllerLooksLikeMarketplaceContext(UIViewController *vc);
+static BOOL FFBIsHomeFeedControllerName(NSString *clsName);
+static BOOL FFBIsReelsOrWatchControllerName(NSString *clsName);
+static NSString *FFBReadSurfaceModuleName(UIViewController *vc);
 
 #pragma mark - Context Menu & Gesture Target Helper
 
@@ -417,6 +433,7 @@ static BOOL FFBIsTabItemView(UIView *view) {
     }
     NSString *clsName = NSStringFromClass(cls);
     return ([clsName isEqualToString:@"UITabBarButton"] ||
+            [clsName isEqualToString:@"_UITabButton"] ||
             [clsName hasSuffix:@"TabBarItemView"] ||
             [clsName hasSuffix:@"TabBarItemDefaultView"]);
 }
@@ -795,6 +812,370 @@ static void FFBSetEntireBottomBarHidden(UIView *bar, BOOL hideEntirely) {
     }
 }
 
+// Osservatore passivo (zero interferenza) per sapere all'istante quale tab ha toccato l'utente
+@interface FFBPassiveTabTouchRecognizer : UIGestureRecognizer
+@property (nonatomic, weak) UIView *hostBar;
+@property (nonatomic, assign) FocusFBTabType tabType;
+@end
+
+@implementation FFBPassiveTabTouchRecognizer
+
+- (instancetype)initWithTarget:(id)target action:(SEL)action {
+    self = [super initWithTarget:target action:action];
+    if (self) {
+        self.cancelsTouchesInView = NO;
+        self.delaysTouchesBegan = NO;
+        self.delaysTouchesEnded = NO;
+    }
+    return self;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesBegan:touches withEvent:event];
+    UIView *bar = self.hostBar;
+    if (bar && self.tabType != FocusFBTabUnknown) {
+        objc_setAssociatedObject(bar, &kBarTappedTypeKey, @(self.tabType), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(bar, &kBarTappedTimeKey, @(CACurrentMediaTime()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(bar, &kBarLastKnownActiveTypeKey, @(self.tabType), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        FFBStartNavbarPillSyncBurst();
+    }
+    self.state = UIGestureRecognizerStateFailed;
+}
+
+- (BOOL)canPreventGestureRecognizer:(__unused UIGestureRecognizer *)preventedGestureRecognizer {
+    return NO;
+}
+
+- (BOOL)canBePreventedByGestureRecognizer:(__unused UIGestureRecognizer *)preventingGestureRecognizer {
+    return NO;
+}
+
+@end
+
+@interface FFBPillSyncDriver : NSObject
++ (instancetype)shared;
+- (void)triggerBurst;
+@end
+
+@implementation FFBPillSyncDriver {
+    CADisplayLink *_displayLink;
+    CFTimeInterval _burstEndTime;
+}
+
++ (instancetype)shared {
+    static FFBPillSyncDriver *inst = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        inst = [[FFBPillSyncDriver alloc] init];
+    });
+    return inst;
+}
+
+- (void)triggerBurst {
+    _burstEndTime = CACurrentMediaTime() + 0.55;
+    if (!_displayLink) {
+        _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onDisplayTick:)];
+        [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    }
+}
+
+- (void)onDisplayTick:(CADisplayLink *)link {
+    if (CACurrentMediaTime() >= _burstEndTime) {
+        [link invalidate];
+        if (_displayLink == link) {
+            _displayLink = nil;
+        }
+        return;
+    }
+    UIWindow *win = FocusFBActiveWindow();
+    if (!win || !win.rootViewController || !win.rootViewController.isViewLoaded) return;
+    NSMutableArray<UIView *> *bars = [NSMutableArray array];
+    FFBFindAllTabBarsInView(win.rootViewController.viewIfLoaded, 0, bars);
+    for (UIView *bar in bars) {
+        if (!bar.hidden && bar.alpha > 0.05) {
+            FFBApplyFilterToTabBar(bar);
+        }
+    }
+}
+
+@end
+
+static void FFBStartNavbarPillSyncBurst(void) {
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[FFBPillSyncDriver shared] triggerBurst];
+        });
+        return;
+    }
+    [[FFBPillSyncDriver shared] triggerBurst];
+}
+
+static NSHashTable<UIGestureRecognizer *> *FFBPausedScrubPanGestures(void) {
+    static NSHashTable<UIGestureRecognizer *> *set = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        set = [NSHashTable weakObjectsHashTable];
+    });
+    return set;
+}
+
+static void FFBSetBarScrubPanGesturesPaused(UIView *bar, BOOL pauseScrub) {
+    if (!bar) return;
+    if (!pauseScrub) {
+        for (UIGestureRecognizer *gr in [FFBPausedScrubPanGestures() allObjects]) {
+            gr.enabled = YES;
+        }
+        [FFBPausedScrubPanGestures() removeAllObjects];
+        return;
+    }
+    NSMutableArray<UIView *> *targets = [NSMutableArray arrayWithObject:bar];
+    for (UIView *sub in bar.subviews) {
+        [targets addObject:sub];
+    }
+    for (UIView *v in targets) {
+        for (UIGestureRecognizer *gr in v.gestureRecognizers) {
+            // Disattiva SOLO il pan orizzontale della barra quando ci sono tab nascosti,
+            // così scorrere il dito non seleziona mai slot fantasma nascosti!
+            if ([gr isMemberOfClass:UIPanGestureRecognizer.class] && gr.isEnabled) {
+                gr.enabled = NO;
+                [FFBPausedScrubPanGestures() addObject:gr];
+            }
+        }
+    }
+}
+
+static FocusFBTabType FFBClassifySingleControllerToTabType(UIViewController *vc) {
+    if (!vc) return FocusFBTabUnknown;
+    NSString *clsName = NSStringFromClass(vc.class) ?: @"";
+    if (FFBControllerLooksLikeMarketplaceContext(vc)) return FocusFBTabMarketplace;
+    if (FFBIsReelsOrWatchControllerName(clsName)) return FocusFBTabReels;
+    if (FFBIsHomeFeedControllerName(clsName)) return FocusFBTabHome;
+
+    NSString *lower = clsName.lowercaseString;
+    NSString *mod = (FFBReadSurfaceModuleName(vc) ?: @"").lowercaseString;
+    if ([lower containsString:@"friending"] || [lower containsString:@"friendcenter"] || [mod containsString:@"friending"]) {
+        return FocusFBTabFriends;
+    }
+    if ([lower containsString:@"groupstab"] || [lower containsString:@"groupslanding"] || [mod containsString:@"groups_tab"]) {
+        return FocusFBTabGroups;
+    }
+    if ([lower containsString:@"notification"] || [mod containsString:@"notifications"]) {
+        return FocusFBTabNotifications;
+    }
+    if ([lower containsString:@"bookmarks"] || [lower containsString:@"menutab"] || [mod containsString:@"bookmarks"]) {
+        return FocusFBTabMenu;
+    }
+    if ([lower containsString:@"profileviewcontroller"] || [lower containsString:@"timelineviewcontroller"] || [mod containsString:@"timeline"]) {
+        return FocusFBTabProfile;
+    }
+    return FocusFBTabUnknown;
+}
+
+static FocusFBTabType FFBDetectActiveTabTypeFromControllers(void) {
+    UIWindow *win = FocusFBActiveWindow();
+    if (!win || !win.rootViewController || !win.rootViewController.isViewLoaded) {
+        return FocusFBTabUnknown;
+    }
+
+    UIViewController *cur = win.rootViewController;
+    NSUInteger guard = 0;
+    while (cur && guard++ < 18) {
+        if ([cur isKindOfClass:UINavigationController.class]) {
+            UINavigationController *nav = (UINavigationController *)cur;
+            if (nav.viewControllers.count > 0) {
+                FocusFBTabType rootType = FFBClassifySingleControllerToTabType(nav.viewControllers.firstObject);
+                if (rootType != FocusFBTabUnknown) return rootType;
+            }
+            UIViewController *top = nav.topViewController;
+            if (!top || top == cur) break;
+            cur = top;
+        } else if ([cur isKindOfClass:UITabBarController.class]) {
+            UIViewController *sel = ((UITabBarController *)cur).selectedViewController;
+            if (!sel || sel == cur) break;
+            cur = sel;
+        } else {
+            FocusFBTabType directType = FFBClassifySingleControllerToTabType(cur);
+            if (directType != FocusFBTabUnknown) return directType;
+            UIViewController *visChild = FFBBestVisibleChildOfContainer(cur, win);
+            if (!visChild || visChild == cur) break;
+            cur = visChild;
+        }
+    }
+    return FFBClassifySingleControllerToTabType(cur);
+}
+
+static void FFBCollectSelectionPillViews(UIView *node,
+                                         UIView *bar,
+                                         CGFloat barW,
+                                         CGFloat barH,
+                                         NSSet<UIView *> *allItemSet,
+                                         NSSet<UIView *> *itemAncestorsSet,
+                                         NSUInteger depth,
+                                         NSMutableArray<UIView *> *outPills) {
+    if (!node || depth > 5 || node.hidden || node.alpha <= 0.02) return;
+    if ([allItemSet containsObject:node]) return;
+
+    if (node != bar && ![itemAncestorsSet containsObject:node]) {
+        CGRect rInBar = [node convertRect:node.bounds toView:bar];
+        CGFloat w = CGRectGetWidth(rInBar);
+        CGFloat h = CGRectGetHeight(rInBar);
+        if (w >= 28.0 && w <= barW * 0.76 && h >= 22.0 && h <= barH + 8.0) {
+            [outPills addObject:node];
+            return; // Non scendere nei subview interni della capsula stessa
+        }
+    }
+
+    for (UIView *sub in node.subviews) {
+        FFBCollectSelectionPillViews(sub, bar, barW, barH, allItemSet, itemAncestorsSet, depth + 1, outPills);
+    }
+}
+
+static void FFBAlignSelectionPillInBar(UIView *bar,
+                                       NSArray<UIView *> *allItems,
+                                       NSArray<UIView *> *allowedItems,
+                                       NSMapTable<UIView *, NSNumber *> *itemToTypeMap) {
+    if (!bar || allowedItems.count == 0) return;
+
+    FocusFBTabType targetType = FocusFBTabUnknown;
+    UIView *selectedAllowedItem = nil;
+
+    // 1. Se l'utente ha appena toccato un tab visibile (< 0.85s), usa subito quel tab!
+    NSNumber *tappedTypeNum = objc_getAssociatedObject(bar, &kBarTappedTypeKey);
+    NSNumber *tappedTimeNum = objc_getAssociatedObject(bar, &kBarTappedTimeKey);
+    if (tappedTypeNum && tappedTimeNum && (CACurrentMediaTime() - tappedTimeNum.doubleValue) < 0.85) {
+        targetType = (FocusFBTabType)tappedTypeNum.integerValue;
+    }
+
+    // 2. Stato attivo del ViewController primario sullo schermo (Home, Reels, Marketplace, ecc.)
+    if (targetType == FocusFBTabUnknown) {
+        FocusFBTabType vcType = FFBDetectActiveTabTypeFromControllers();
+        if (vcType != FocusFBTabUnknown) {
+            targetType = vcType;
+            objc_setAssociatedObject(bar, &kBarLastKnownActiveTypeKey, @(vcType), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    }
+
+    // 3. Controlla UITabBar.selectedItem o UIAccessibilityTraitSelected / UIControl.isSelected
+    if (targetType == FocusFBTabUnknown && [bar isKindOfClass:UITabBar.class]) {
+        UITabBarItem *selTBItem = ((UITabBar *)bar).selectedItem;
+        if (selTBItem) {
+            NSString *ident = selTBItem.accessibilityIdentifier ?: @"";
+            NSString *lbl = selTBItem.title ?: selTBItem.accessibilityLabel ?: @"";
+            targetType = [FocusFBPrefs classifyTabWithIdentifier:ident label:lbl];
+        }
+    }
+    if (targetType == FocusFBTabUnknown) {
+        for (UIView *item in allowedItems) {
+            if (FFBIsItemMarkedSelected(item, 0)) {
+                selectedAllowedItem = item;
+                break;
+            }
+        }
+    }
+
+    // 4. Fallback sull'ultimo tab attivo noto
+    if (!selectedAllowedItem && targetType == FocusFBTabUnknown) {
+        NSNumber *lastKnown = objc_getAssociatedObject(bar, &kBarLastKnownActiveTypeKey);
+        if (lastKnown) {
+            targetType = (FocusFBTabType)lastKnown.integerValue;
+        }
+    }
+
+    if (!selectedAllowedItem && targetType != FocusFBTabUnknown) {
+        for (UIView *item in allowedItems) {
+            NSNumber *tNum = [itemToTypeMap objectForKey:item];
+            if (tNum && (FocusFBTabType)tNum.integerValue == targetType) {
+                selectedAllowedItem = item;
+                break;
+            }
+        }
+    }
+    if (!selectedAllowedItem) {
+        selectedAllowedItem = allowedItems.firstObject;
+    }
+    if (!selectedAllowedItem || !selectedAllowedItem.superview) return;
+
+    NSSet<UIView *> *allItemSet = [NSSet setWithArray:allItems];
+    NSMutableSet<UIView *> *itemAncestorsSet = [NSMutableSet set];
+    for (UIView *it in allItems) {
+        for (UIView *anc = it.superview; anc != nil && anc != bar.superview; anc = anc.superview) {
+            [itemAncestorsSet addObject:anc];
+            if (anc == bar) break;
+        }
+    }
+
+    CGFloat barW = CGRectGetWidth(bar.bounds);
+    CGFloat barH = CGRectGetHeight(bar.bounds);
+    if (barW < 40.0 || barH < 24.0) return;
+
+    NSMutableArray<UIView *> *pillViews = [NSMutableArray array];
+    FFBCollectSelectionPillViews(bar, bar, barW, barH, allItemSet, itemAncestorsSet, 0, pillViews);
+
+            for (UIView *pill in pillViews) {
+        UIView *pillSuper = pill.superview;
+        if (!pillSuper) continue;
+        if (pillSuper != bar) {
+            [pillSuper layoutIfNeeded];
+        }
+
+        CGPoint targetPt = [selectedAllowedItem.superview convertPoint:selectedAllowedItem.center toView:pillSuper];
+        CGFloat targetX = targetPt.x;
+        CGFloat currentModelX = pill.center.x;
+
+        if (fabs(currentModelX - targetX) > 0.5) {
+            CALayer *presLayer = pill.layer.presentationLayer;
+            CGFloat startX = presLayer ? presLayer.position.x : currentModelX;
+            BOOL hadNativeAnim = (pill.layer.animationKeys.count > 0);
+
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            [pill.layer removeAllAnimations];
+            pill.center = CGPointMake(targetX, pill.center.y);
+            [CATransaction commit];
+
+            if (hadNativeAnim && fabs(startX - targetX) > 2.5) {
+                CABasicAnimation *slide = [CABasicAnimation animationWithKeyPath:@"position.x"];
+                slide.fromValue = @(startX);
+                slide.toValue = @(targetX);
+                slide.duration = 0.22;
+                slide.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseOut];
+                [pill.layer addAnimation:slide forKey:@"ffb_pill_slide"];
+            }
+        }
+    }
+
+    // Allinea anche eventuali CALayer capsula non associati a una UIView
+    for (UIView *host in [itemAncestorsSet allObjects]) {
+        for (CALayer *sublayer in host.layer.sublayers) {
+            if (sublayer.hidden || sublayer.opacity <= 0.02f) continue;
+            if (sublayer.delegate && [sublayer.delegate isKindOfClass:UIView.class]) continue;
+            CGFloat lw = CGRectGetWidth(sublayer.bounds);
+            CGFloat lh = CGRectGetHeight(sublayer.bounds);
+            if (lw >= 28.0 && lw <= barW * 0.76 && lh >= 22.0 && lh <= barH + 8.0) {
+                CGPoint targetPt = [selectedAllowedItem.superview convertPoint:selectedAllowedItem.center toView:host];
+                if (fabs(sublayer.position.x - targetPt.x) > 0.5) {
+                    [CATransaction begin];
+                    [CATransaction setDisableActions:YES];
+                    sublayer.position = CGPointMake(targetPt.x, sublayer.position.y);
+                    [CATransaction commit];
+                }
+            }
+        }
+    }
+}
+
+static void FFBAttachPassiveTouchTracker(UIView *item, UIView *bar, FocusFBTabType tabType) {
+    if (!item || !bar) return;
+    FFBPassiveTabTouchRecognizer *tracker = objc_getAssociatedObject(item, &kItemTouchTrackerKey);
+    if (!tracker || ![item.gestureRecognizers containsObject:tracker]) {
+        tracker = [[FFBPassiveTabTouchRecognizer alloc] initWithTarget:nil action:NULL];
+        [item addGestureRecognizer:tracker];
+        objc_setAssociatedObject(item, &kItemTouchTrackerKey, tracker, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    tracker.hostBar = bar;
+    tracker.tabType = tabType;
+}
+
 static void FFBApplyFilterToTabBar(UIView *bar) {
     if (!bar || gIsReflowingNavbar || !NSThread.isMainThread) return;
 
@@ -804,8 +1185,8 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
     NSInteger currentW = (NSInteger)llround(CGRectGetWidth(bar.bounds));
     NSUInteger subCount = bar.subviews.count;
 
-    // Fast-path 120Hz: quando la barra è già nascosta e né preferenze né larghezza sono cambiate,
-    // non scansionare MAI subview o accessibilityLabel ad ogni frame di scroll!
+    // Fast-path 120Hz: quando la barra è completamente nascosta (modalità 1 solo tab),
+    // non scansionare MAI subview o accessibilityLabel durante lo scroll!
     FFBCachedNavbarPass *cachedPass = objc_getAssociatedObject(bar, &kCachedBarPassKey);
     if (cachedPass &&
         cachedPass.prefsGeneration == currentGen &&
@@ -831,19 +1212,82 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             return;
         }
 
-        // Salva indice canonico e frame nativo di ciascun tab prima del reflow
+        // Mappa immutabile dell'ordine nativo dei tab per questa barra (sopravvive alla ricreazione delle view!)
+        NSMutableDictionary<NSString *, NSNumber *> *canonicalSlotMap = objc_getAssociatedObject(bar, &kBarCanonicalSlotMapKey);
+        BOOL isFirstCaptureForBar = (canonicalSlotMap == nil);
+        if (!canonicalSlotMap) {
+            canonicalSlotMap = [NSMutableDictionary dictionary];
+            // Al primo passaggio ordina per coordinata X nativa (prima di qualsiasi nostro reflow)
+            [items sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
+                if (a.center.x < b.center.x) return NSOrderedAscending;
+                if (a.center.x > b.center.x) return NSOrderedDescending;
+                return NSOrderedSame;
+            }];
+            objc_setAssociatedObject(bar, &kBarCanonicalSlotMapKey, canonicalSlotMap, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+
+        // Salva centro e bounds originali SOLO quando transform == Identity (mai corrompere bounds durante bounce!)
         for (NSUInteger idx = 0; idx < items.count; idx++) {
             UIView *item = items[idx];
-            if (!objc_getAssociatedObject(item, &kOrigIndexKey)) {
-                objc_setAssociatedObject(item, &kOrigIndexKey, @(idx), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            }
-            if (!CGRectIsEmpty(item.frame) && !objc_getAssociatedObject(item, &kOrigFrameKey)) {
-                objc_setAssociatedObject(item, &kOrigFrameKey, [NSValue valueWithCGRect:item.frame], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (CGAffineTransformIsIdentity(item.transform) && !CGRectIsEmpty(item.bounds)) {
+                if (!objc_getAssociatedObject(item, &kOrigCenterKey)) {
+                    objc_setAssociatedObject(item, &kOrigCenterKey, [NSValue valueWithCGPoint:item.center], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                if (!objc_getAssociatedObject(item, &kOrigBoundsSizeKey)) {
+                    objc_setAssociatedObject(item, &kOrigBoundsSizeKey, [NSValue valueWithCGSize:item.bounds.size], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
             }
             FFBAttachContextMenuToTabItem(item);
         }
 
-        // Ordina secondo l'indice nativo per non invertire mai l'ordine dei tab
+        // Descrivi ciascun item e registra lo slot canonico immutabile
+        NSMapTable<UIView *, NSNumber *> *itemToTypeMap = [NSMapTable weakToStrongObjectsMapTable];
+        NSMapTable<UIView *, NSString *> *itemToKeyMap = [NSMapTable weakToStrongObjectsMapTable];
+
+        NSArray<UITabBarItem *> *nativeTBItems = [bar isKindOfClass:UITabBar.class] ? ((UITabBar *)bar).items : nil;
+
+        for (NSUInteger idx = 0; idx < items.count; idx++) {
+            UIView *item = items[idx];
+            NSString *key = nil;
+            NSString *ident = nil;
+            NSString *label = nil;
+            FocusFBTabType type = FocusFBTabUnknown;
+            FFBDescribeTabItem(item, idx, &key, &ident, &label, &type);
+
+            if (type == FocusFBTabUnknown && nativeTBItems.count > 0) {
+                NSUInteger tbIdx = idx % nativeTBItems.count;
+                UITabBarItem *tbItem = nativeTBItems[tbIdx];
+                NSString *tbIdent = tbItem.accessibilityIdentifier ?: @"";
+                NSString *tbLbl = tbItem.title ?: tbItem.accessibilityLabel ?: @"";
+                FocusFBTabType tbType = [FocusFBPrefs classifyTabWithIdentifier:tbIdent label:tbLbl];
+                if (tbType != FocusFBTabUnknown) {
+                    type = tbType;
+                    key = [NSString stringWithFormat:@"type:%ld", (long)type];
+                }
+            }
+
+            if (isFirstCaptureForBar && key.length > 0 && canonicalSlotMap[key] == nil) {
+                canonicalSlotMap[key] = @(idx);
+            }
+            NSNumber *canonIdx = (key.length > 0) ? canonicalSlotMap[key] : nil;
+            if (canonIdx != nil) {
+                objc_setAssociatedObject(item, &kOrigIndexKey, canonIdx, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            } else if (!objc_getAssociatedObject(item, &kOrigIndexKey)) {
+                objc_setAssociatedObject(item, &kOrigIndexKey, @(100 + idx), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+
+            [itemToTypeMap setObject:@(type) forKey:item];
+            if (key) [itemToKeyMap setObject:key forKey:item];
+            FFBAttachPassiveTouchTracker(item, bar, type);
+
+            [prefs recordDiscoveredTabWithKey:(key ?: @"slot:0")
+                                        label:(label ?: @"-")
+                                   identifier:(ident ?: @"-")
+                                    className:NSStringFromClass(object_getClass(item))
+                                      tabType:type];
+        }
+
+        // Ordina secondo lo slot canonico immutabile
         [items sortUsingComparator:^NSComparisonResult(UIView *a, UIView *b) {
             NSUInteger ia = [objc_getAssociatedObject(a, &kOrigIndexKey) unsignedIntegerValue];
             NSUInteger ib = [objc_getAssociatedObject(b, &kOrigIndexKey) unsignedIntegerValue];
@@ -853,20 +1297,9 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
         }];
 
         NSMutableArray<UIView *> *allowedItems = [NSMutableArray array];
-        for (NSUInteger idx = 0; idx < items.count; idx++) {
-            UIView *item = items[idx];
-            NSString *key = nil;
-            NSString *ident = nil;
-            NSString *label = nil;
-            FocusFBTabType type = FocusFBTabUnknown;
-            FFBDescribeTabItem(item, idx, &key, &ident, &label, &type);
-
-            [prefs recordDiscoveredTabWithKey:key
-                                        label:label
-                                   identifier:ident
-                                    className:NSStringFromClass(object_getClass(item))
-                                      tabType:type];
-
+        for (UIView *item in items) {
+            FocusFBTabType type = (FocusFBTabType)[[itemToTypeMap objectForKey:item] integerValue];
+            NSString *key = [itemToKeyMap objectForKey:item] ?: @"";
             if (forceMPOnly) {
                 if (type == FocusFBTabMarketplace) {
                     [allowedItems addObject:item];
@@ -889,26 +1322,46 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
         // Se FocusFB è spento, ripristina tutti gli elementi e l'intera barra
         if (!prefs.enabled) {
             FFBSetEntireBottomBarHidden(bar, NO);
+            FFBSetBarScrubPanGesturesPaused(bar, NO);
             for (UIView *item in items) {
                 item.hidden = NO;
                 item.alpha = 1.0;
                 item.userInteractionEnabled = YES;
-                NSValue *origVal = objc_getAssociatedObject(item, &kOrigFrameKey);
-                if (origVal) item.frame = origVal.CGRectValue;
+                NSValue *origCenter = objc_getAssociatedObject(item, &kOrigCenterKey);
+                NSValue *origSize = objc_getAssociatedObject(item, &kOrigBoundsSizeKey);
+                if (origSize && CGAffineTransformIsIdentity(item.transform)) {
+                    CGRect b = item.bounds;
+                    b.size = origSize.CGSizeValue;
+                    item.bounds = b;
+                }
+                if (origCenter) {
+                    item.center = origCenter.CGPointValue;
+                }
             }
             saveNavbarCache(NO);
             gIsReflowingNavbar = NO;
             return;
         }
 
-        // Guardia di sicurezza: se tutti i tab presenti sulla barra risultano nascosti
-        // (es. Marketplace non è tra i 5 tab fissati dall'account), mantieni almeno l'ultimo tab (Menu)
+        // Guardia di sicurezza: se tutti i tab presenti sulla barra risultano nascosti, mantieni almeno l'ultimo tab
         if (allowedItems.count == 0 && items.count > 0 && !prefs.hideSingleTabBar) {
             [allowedItems addObject:items.lastObject];
         }
 
-        // Opzione: nascondi COMPLETAMENTE l'intera barra bianca inferiore ed espandi a tutto schermo quando resta <= 1 tab
-        if (allowedItems.count <= 1 && prefs.hideSingleTabBar) {
+        // Nascondi COMPLETAMENTE la barra inferiore ed espandi a tutto schermo quando resta <= 1 tab (es. Solo Marketplace)
+        // Nota: su _UITabBarPlatterView a doppio layer (SelectedContentView + ContentView) conta i tab unici per parent!
+        NSUInteger maxAllowedPerParent = 0;
+        {
+            NSMapTable<UIView *, NSNumber *> *countsByParent = [NSMapTable weakToStrongObjectsMapTable];
+            for (UIView *it in allowedItems) {
+                UIView *p = it.superview ?: bar;
+                NSUInteger c = [[countsByParent objectForKey:p] unsignedIntegerValue] + 1;
+                [countsByParent setObject:@(c) forKey:p];
+                if (c > maxAllowedPerParent) maxAllowedPerParent = c;
+            }
+        }
+
+        if (maxAllowedPerParent <= 1 && prefs.hideSingleTabBar) {
             FFBSetEntireBottomBarHidden(bar, YES);
             saveNavbarCache(YES);
             gIsReflowingNavbar = NO;
@@ -918,6 +1371,8 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             saveNavbarCache(NO);
         }
 
+        FFBSetBarScrubPanGesturesPaused(bar, allowedItems.count < items.count);
+
         NSSet<UIView *> *allowedSet = [NSSet setWithArray:allowedItems];
         for (UIView *item in items) {
             BOOL show = [allowedSet containsObject:item];
@@ -926,7 +1381,7 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             item.userInteractionEnabled = show;
         }
 
-        // Centra e ridistribuisce orizzontalmente i tab rimasti all'interno della rispettiva superview
+        // Distribuisci i tab visibili tramite solo `item.center` (MAI mutare `item.frame` o `bounds` durante animazioni transform!)
         if (prefs.reflowVisibleTabs && allowedItems.count > 0) {
             NSMapTable<UIView *, NSMutableArray<UIView *> *> *byParent = [NSMapTable weakToStrongObjectsMapTable];
             for (UIView *item in allowedItems) {
@@ -941,27 +1396,34 @@ static void FFBApplyFilterToTabBar(UIView *bar) {
             }
 
             for (UIView *parent in byParent.keyEnumerator) {
+                if (parent != bar) {
+                    [parent layoutIfNeeded];
+                }
+                if ([parent isKindOfClass:UIStackView.class]) {
+                    continue; // UIStackView ridistribuisce nativamente gli arrangedSubviews visibili!
+                }
                 NSMutableArray<UIView *> *group = [byParent objectForKey:parent];
                 CGFloat parentW = CGRectGetWidth(parent.bounds);
+                CGFloat parentH = CGRectGetHeight(parent.bounds);
                 if (parentW < 30.0 || group.count == 0) continue;
 
-                CGFloat maxSlotW = 92.0;
-                CGFloat slotW = MIN(parentW / (CGFloat)group.count, maxSlotW);
-                CGFloat totalW = slotW * (CGFloat)group.count;
-                CGFloat startX = floor((parentW - totalW) * 0.5);
-
+                CGFloat slotW = parentW / (CGFloat)group.count;
                 for (NSUInteger i = 0; i < group.count; i++) {
                     UIView *item = group[i];
-                    CGRect frame = item.frame;
-                    frame.origin.x = startX + (CGFloat)i * slotW;
-                    frame.size.width = slotW;
-                    item.frame = frame;
+                    CGFloat cx = ((CGFloat)i + 0.5) * slotW;
+                    CGFloat cy = (item.center.y > 2.0 && item.center.y < parentH - 2.0)
+                                 ? item.center.y
+                                 : (parentH * 0.5);
+                    item.center = CGPointMake(cx, cy);
                 }
             }
+
+            // Centra sempre la pillola di selezione (highlight) esattamente sopra l'icona del tab attivo!
+            FFBAlignSelectionPillInBar(bar, items, allowedItems, itemToTypeMap);
         } else {
             for (UIView *item in allowedItems) {
-                NSValue *origVal = objc_getAssociatedObject(item, &kOrigFrameKey);
-                if (origVal) item.frame = origVal.CGRectValue;
+                NSValue *origCenter = objc_getAssociatedObject(item, &kOrigCenterKey);
+                if (origCenter) item.center = origCenter.CGPointValue;
             }
         }
     } @catch (__unused NSException *e) {
@@ -1900,6 +2362,20 @@ static void FFBHook_NativeGlassBar_layoutSubviews(id self, SEL _cmd) {
     FFBApplyFilterToTabBar((UIView *)self);
 }
 
+static void FFBHook_PlatterView_layoutSubviews(id self, SEL _cmd) {
+    if (gOrigPlatterViewLayout) gOrigPlatterViewLayout(self, _cmd);
+    UIView *cur = ((UIView *)self).superview;
+    int hops = 0;
+    while (cur && hops < 5) {
+        if (FFBIsFacebookNavbarView(cur) || [cur isKindOfClass:UITabBar.class]) {
+            FFBApplyFilterToTabBar(cur);
+            break;
+        }
+        cur = cur.superview;
+        hops++;
+    }
+}
+
 static void FFBHook_LegacyBar_layoutSubviews(id self, SEL _cmd) {
     if (gOrigLegacyBarLayout) gOrigLegacyBarLayout(self, _cmd);
     FFBApplyFilterToTabBar((UIView *)self);
@@ -1978,6 +2454,14 @@ static void FFBHook_setTabBarViewOffsetFraction(id self, SEL _cmd, double fracti
     }
 }
 
+static void FFBHook_UIScrollView_layoutSubviews(id self, SEL _cmd) {
+    if (gOrigScrollViewLayout) gOrigScrollViewLayout(self, _cmd);
+    UIScrollView *sv = (UIScrollView *)self;
+    // Controllo di 1 nanosecondo: esce subito su Marketplace e Feed (mai pagingEnabled)!
+    if (!sv.isPagingEnabled || [sv isKindOfClass:UICollectionView.class]) return;
+    FocusFBMediaDownloaderOnScrollLayout(sv);
+}
+
 static void FFBHook_UICollectionView_layoutSubviews(id self, SEL _cmd) {
     if (gOrigCollectionViewLayout) gOrigCollectionViewLayout(self, _cmd);
 
@@ -1985,6 +2469,8 @@ static void FFBHook_UICollectionView_layoutSubviews(id self, SEL _cmd) {
     if (!prefs.enabled) return;
 
     UICollectionView *cv = (UICollectionView *)self;
+    FocusFBMediaDownloaderOnScrollLayout(cv);
+
     if (!FFBCollectionViewBelongsToHomeFeed(cv)) {
         return; // O(1) immediato su Marketplace e su tutte le altre schermate!
     }
@@ -2025,6 +2511,9 @@ static void FFBHook_VC_viewWillAppear(id self, SEL _cmd, BOOL animated) {
     if (FFBIsHomeFeedControllerName(clsName)) {
         FFBApplyControllerProtection(vc);
     }
+    if ([clsName hasPrefix:@"FB"] || [clsName hasPrefix:@"RCT"]) {
+        FFBStartNavbarPillSyncBurst();
+    }
 }
 
 static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
@@ -2045,6 +2534,7 @@ static void FFBHook_VC_viewDidAppear(id self, SEL _cmd, BOOL animated) {
         FFBApplyControllerProtection(vc);
         [[FocusFBLockManager shared] refreshEnforcementUI];
         FocusFBMediaDownloaderSyncUI();
+        FFBStartNavbarPillSyncBurst();
 
         if (FFBClassInheritsName(vc.class, kTabControllerName)) {
             FocusFBRefreshUIImmediately();
@@ -2112,6 +2602,21 @@ static void FFBInstallDynamicHooksAvailableNow(void) {
                                                                      @selector(layoutSubviews),
                                                                      (IMP)FFBHook_UICollectionView_layoutSubviews,
                                                                      (IMP *)&gOrigCollectionViewLayout);
+    }
+    if (!gHooksInstalledScrollLayout) {
+        gHooksInstalledScrollLayout = FFBHookSpecificClassMethod(UIScrollView.class,
+                                                                 @selector(layoutSubviews),
+                                                                 (IMP)FFBHook_UIScrollView_layoutSubviews,
+                                                                 (IMP *)&gOrigScrollViewLayout);
+    }
+    if (!gHooksInstalledPlatterView) {
+        Class platterCls = NSClassFromString(@"_UITabBarPlatterView");
+        if (platterCls) {
+            gHooksInstalledPlatterView = FFBHookSpecificClassMethod(platterCls,
+                                                                    @selector(layoutSubviews),
+                                                                    (IMP)FFBHook_PlatterView_layoutSubviews,
+                                                                    (IMP *)&gOrigPlatterViewLayout);
+        }
     }
     if (!gHooksInstalledFBCompSize) {
         Class compDS = NSClassFromString(@"FBComponentCollectionViewDataSource");

@@ -11,30 +11,21 @@
 #import <objc/message.h>
 #include <os/lock.h>
 
-static const NSInteger kFFBQuickDownloadBtnTag = 0x70C5D1;
-static const NSInteger kFFBShareSheetBarTag    = 0x70C5D2;
+static const NSInteger kFFBInlineReelDownloadBtnTag = 0x70C5D5;
 
 typedef void (*FFBAVPlayerReplaceItemIMP)(id, SEL, AVPlayerItem *);
-typedef void (*FFBWindowDidAddSubviewIMP)(id, SEL, UIView *);
-typedef void (*FFBAppSendEventMediaIMP)(id, SEL, UIEvent *);
 
 static FFBAVPlayerReplaceItemIMP gOrigAVPlayerReplaceItem = NULL;
-static FFBWindowDidAddSubviewIMP gOrigWindowDidAddSubview = NULL;
-static FFBAppSendEventMediaIMP   gOrigAppSendEventMedia   = NULL;
-
-static BOOL gInstalledPlayerHook    = NO;
-static BOOL gInstalledWindowAddHook = NO;
-static BOOL gInstalledSendEventHook = NO;
-static BOOL gMediaDownloaderReady   = NO;
-static BOOL gDownloadInFlight       = NO;
-static CGPoint gLastTouchDownPt     = {0.0, 0.0};
-static uint64_t gTouchSeqID         = 0;
+static BOOL gInstalledPlayerHook  = NO;
+static BOOL gMediaDownloaderReady = NO;
+static BOOL gDownloadInFlight     = NO;
 
 static os_unfair_lock gPlayerTrackLock = OS_UNFAIR_LOCK_INIT;
 static NSHashTable<AVPlayer *> *gTrackedAVPlayers = nil;
+static NSHashTable<UIButton *> *gMountedReelButtons = nil;
 
-static NSTimer *gQuickBtnVisibilityTimer = nil;
-static NSTimer *gShareSheetFollowTimer   = nil;
+static char kIsReelsCollectionCacheKey;
+static char kLastCellBtnSyncTimeKey;
 
 // Selettori opzionali delle classi video interne di Facebook (FBVideoPlayback*, FBSnacks*, FNF*)
 @interface NSObject (FFBFacebookVideoSelectors)
@@ -53,7 +44,81 @@ static NSTimer *gShareSheetFollowTimer   = nil;
 @end
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 1. Modello Candidato Video / Reel / Storia Video
+// 1. Icone Vettoriali nello Stile Esatto di Facebook Reels (Stroke 2.15pt #FFFFFF)
+// ─────────────────────────────────────────────────────────────────────────────
+
+static UIImage *FFBReelOutlineDownloadImage(void) {
+    static UIImage *cachedImg = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        CGSize sz = CGSizeMake(26.0, 26.0);
+        UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+        fmt.opaque = NO;
+        fmt.scale = UIScreen.mainScreen.scale;
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
+        cachedImg = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            CGContextRef cg = ctx.CGContext;
+            CGContextSetStrokeColorWithColor(cg, [UIColor whiteColor].CGColor);
+            CGContextSetLineWidth(cg, 2.15);
+            CGContextSetLineCap(cg, kCGLineCapRound);
+            CGContextSetLineJoin(cg, kCGLineJoinRound);
+
+            // Asta verticale freccia
+            CGContextMoveToPoint(cg, 13.0, 3.4);
+            CGContextAddLineToPoint(cg, 13.0, 16.2);
+            CGContextStrokePath(cg);
+
+            // Punta freccia arrotondata
+            CGContextMoveToPoint(cg, 7.9, 11.4);
+            CGContextAddLineToPoint(cg, 13.0, 16.5);
+            CGContextAddLineToPoint(cg, 18.1, 11.4);
+            CGContextStrokePath(cg);
+
+            // Vaschetta inferiore arrotondata (stesso raggio degli angoli di Mi piace / Salva di Facebook)
+            UIBezierPath *tray = [UIBezierPath bezierPath];
+            tray.lineWidth = 2.15;
+            tray.lineCapStyle = kCGLineCapRound;
+            tray.lineJoinStyle = kCGLineJoinRound;
+            [tray moveToPoint:CGPointMake(4.4, 16.4)];
+            [tray addLineToPoint:CGPointMake(4.4, 19.6)];
+            [tray addQuadCurveToPoint:CGPointMake(7.0, 22.2) controlPoint:CGPointMake(4.4, 22.2)];
+            [tray addLineToPoint:CGPointMake(19.0, 22.2)];
+            [tray addQuadCurveToPoint:CGPointMake(21.6, 19.6) controlPoint:CGPointMake(21.6, 22.2)];
+            [tray addLineToPoint:CGPointMake(21.6, 16.4)];
+            [[UIColor whiteColor] setStroke];
+            [tray stroke];
+        }];
+    });
+    return cachedImg;
+}
+
+static UIImage *FFBReelOutlineCheckmarkImage(void) {
+    static UIImage *cachedCheck = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        CGSize sz = CGSizeMake(26.0, 26.0);
+        UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+        fmt.opaque = NO;
+        fmt.scale = UIScreen.mainScreen.scale;
+        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
+        cachedCheck = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+            CGContextRef cg = ctx.CGContext;
+            CGContextSetStrokeColorWithColor(cg, [UIColor whiteColor].CGColor);
+            CGContextSetLineWidth(cg, 2.25);
+            CGContextSetLineCap(cg, kCGLineCapRound);
+            CGContextSetLineJoin(cg, kCGLineJoinRound);
+
+            CGContextMoveToPoint(cg, 5.5, 13.8);
+            CGContextAddLineToPoint(cg, 10.8, 19.2);
+            CGContextAddLineToPoint(cg, 20.6, 7.6);
+            CGContextStrokePath(cg);
+        }];
+    });
+    return cachedCheck;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2. Modello Candidato Video & Estrazione Stream (FNF / DASH efg= / HLS / AVPlayer)
 // ─────────────────────────────────────────────────────────────────────────────
 
 @interface FFBMediaCandidate : NSObject
@@ -72,12 +137,6 @@ static NSTimer *gShareSheetFollowTimer   = nil;
     return (self.hdVideoURL != nil || self.sdVideoURL != nil || self.avAsset != nil);
 }
 @end
-
-static FFBMediaCandidate *gRecentActiveVideoCandidate = nil;
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 2. Risoluzione URL Video, Analisi Header DASH `efg=` & Scansione Profonda FNF/Reels
-// ─────────────────────────────────────────────────────────────────────────────
 
 static NSURL *FFBLookupURLForAsset(AVAsset *asset) {
     if (!asset) return nil;
@@ -162,7 +221,6 @@ static FFBStreamKind FFBClassifyStreamURL(NSURL *url, NSString * _Nullable hintN
     NSString *lower = abs.lowercaseString;
     if (![lower hasPrefix:@"http"]) return FFBStreamKindNotVideo;
 
-    // Escludi sempre immagini statiche / avatar / anteprime
     NSString *pathLower = url.path.lowercaseString ?: @"";
     if ([pathLower hasSuffix:@".jpg"] || [pathLower hasSuffix:@".jpeg"] ||
         [pathLower hasSuffix:@".png"] || [pathLower hasSuffix:@".webp"] ||
@@ -226,7 +284,6 @@ static void FFBRecordURLIntoCandidate(NSURL *url,
     if (kind == FFBStreamKindProgressiveVideoWithAudio) score += 5000;
     else if (kind == FFBStreamKindHLSPlaylist) score += 3500;
     else if (kind == FFBStreamKindDASHVideoTrack) score += 1000;
-
     if ([hint.lowercaseString containsString:@"hd"]) score += 800;
 
     if (!cand.hdVideoURL || score > *bestVideoScore) {
@@ -268,7 +325,6 @@ static BOOL FFBSkipDeepIvarClassName(NSString *clsName) {
     return NO;
 }
 
-// Scansione ivar a 3 livelli (eseguita SOLO su apertura menu Condividi o tap Download, zero costo durante lo scroll!)
 static void FFBDeepScanObjectForVideoStreams(id obj,
                                              NSString * _Nullable hint,
                                              int hopDepth,
@@ -327,7 +383,6 @@ static void FFBDeepScanObjectForVideoStreams(id obj,
     if ([visited containsObject:ptrKey]) return;
     [visited addObject:ptrKey];
 
-    // Selettori diretti noti su FBVideoPlaybackController / FBVideoPlaybackItem / FBSnacksVideoManager
     FFBPopulateFromPlaybackItem(obj, cand, bestVideoScore);
     id item = FFBSafeObjectProperty(obj, @selector(currentVideoPlaybackItem));
     if (item) {
@@ -404,6 +459,15 @@ static BOOL FFBViewHostsCustomVideoLayerOrComponent(UIView *view) {
     return NO;
 }
 
+static BOOL FFBSubtreeContainsAnyVideoSurface(UIView *view, NSUInteger depth) {
+    if (!view || depth > 28 || view.hidden || view.alpha <= 0.02) return NO;
+    if (FFBViewHostsCustomVideoLayerOrComponent(view)) return YES;
+    for (UIView *sub in view.subviews) {
+        if (FFBSubtreeContainsAnyVideoSurface(sub, depth + 1)) return YES;
+    }
+    return NO;
+}
+
 static AVPlayer *FFBExtractAVPlayerFromView(UIView *view) {
     if (!view) return nil;
     if ([view.layer isKindOfClass:AVPlayerLayer.class]) {
@@ -422,13 +486,11 @@ static AVPlayer *FFBExtractAVPlayerFromView(UIView *view) {
 
 static void FFBScanSubtreeForVideos(UIView *view,
                                     UIWindow *win,
-                                    UIView * _Nullable excludedSheetSubtree,
                                     NSUInteger depth,
                                     int *visitedNodes,
                                     NSMutableArray<FFBMediaCandidate *> *outCandidates) {
     if (!view || depth > 44 || *visitedNodes > 4500) return;
-    if (view == excludedSheetSubtree || view.hidden || view.alpha <= 0.02) return;
-    if (view.tag == kFFBQuickDownloadBtnTag || view.tag == kFFBShareSheetBarTag) return;
+    if (view.hidden || view.alpha <= 0.02 || view.tag == kFFBInlineReelDownloadBtnTag) return;
     (*visitedNodes)++;
 
     CGRect rectInWin = [view convertRect:view.bounds toView:win];
@@ -457,14 +519,12 @@ static void FFBScanSubtreeForVideos(UIView *view,
         NSMutableSet<NSValue *> *visited = [NSMutableSet set];
         FFBDeepScanObjectForVideoStreams(view, nil, 0, visited, cand, &bestStreamScore);
 
-        // Controlla anche il UIViewController proprietario della vista (es. FBSnacksBucketViewController)
         UIResponder *resp = view.nextResponder;
         if ([resp isKindOfClass:UIViewController.class]) {
             FFBDeepScanObjectForVideoStreams(resp, nil, 0, visited, cand, &bestStreamScore);
         }
 
         if ([cand hasUsableVideo]) {
-            // Bonus per il video più centrato sullo schermo (evita Reel pre-caricati fuori vista)
             CGPoint winCenter = CGPointMake(CGRectGetMidX(win.bounds), CGRectGetMidY(win.bounds));
             CGPoint vCenter = CGPointMake(CGRectGetMidX(vis), CGRectGetMidY(vis));
             CGFloat dist = hypot(winCenter.x - vCenter.x, winCenter.y - vCenter.y);
@@ -474,53 +534,29 @@ static void FFBScanSubtreeForVideos(UIView *view,
     }
 
     for (UIView *sub in view.subviews) {
-        FFBScanSubtreeForVideos(sub, win, excludedSheetSubtree, depth + 1, visitedNodes, outCandidates);
+        FFBScanSubtreeForVideos(sub, win, depth + 1, visitedNodes, outCandidates);
     }
 }
 
-static void FFBCollectVideoFromStoryControllers(UIViewController *vc,
-                                                NSUInteger depth,
-                                                NSMutableArray<FFBMediaCandidate *> *outCandidates) {
-    if (!vc || depth > 12) return;
-    NSString *clsName = NSStringFromClass(vc.class) ?: @"";
-    if ([clsName containsString:@"SnacksBucketViewController"] ||
-        [clsName containsString:@"SnacksMediaContainer"] ||
-        [clsName containsString:@"SnacksThreadContainer"]) {
-        if (vc.isViewLoaded && !vc.view.hidden && vc.view.window) {
-            FFBMediaCandidate *cand = [[FFBMediaCandidate alloc] init];
-            int bestScore = 0;
-            NSMutableSet<NSValue *> *visited = [NSMutableSet set];
-            FFBDeepScanObjectForVideoStreams(vc, nil, 0, visited, cand, &bestScore);
-            if ([cand hasUsableVideo]) {
-                CGRect b = vc.view.bounds;
-                cand.rawVisibleArea = CGRectGetWidth(b) * CGRectGetHeight(b);
-                cand.screenAreaScore = cand.rawVisibleArea + (CGFloat)(bestScore * 50);
-                cand.capturedAt = CFAbsoluteTimeGetCurrent();
-                [outCandidates addObject:cand];
-            }
-        }
-    }
-    for (UIViewController *child in vc.childViewControllers) {
-        FFBCollectVideoFromStoryControllers(child, depth + 1, outCandidates);
-    }
-    if (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
-        FFBCollectVideoFromStoryControllers(vc.presentedViewController, depth + 1, outCandidates);
-    }
-}
-
-static FFBMediaCandidate *FFBFindActiveVideoOnScreen(UIView * _Nullable excludedSheetSubtree) {
+static FFBMediaCandidate *FFBFindBestCandidateForReelScope(UIView * _Nullable preferredReelPage) {
     UIWindow *mainWin = FocusFBActiveWindow();
     if (!mainWin) return nil;
 
     NSMutableArray<FFBMediaCandidate *> *candidates = [NSMutableArray array];
-    int visitedNodes = 0;
-    FFBScanSubtreeForVideos(mainWin, mainWin, excludedSheetSubtree, 0, &visitedNodes, candidates);
 
-    if (FocusFBIsStoryViewerVisibleNow() && mainWin.rootViewController) {
-        FFBCollectVideoFromStoryControllers(mainWin.rootViewController, 0, candidates);
+    // 1. Scansiona prima la pagina specifica del Reel su cui l'utente ha premuto Download
+    if (preferredReelPage && preferredReelPage.window == mainWin) {
+        int visitedPage = 0;
+        FFBScanSubtreeForVideos(preferredReelPage, mainWin, 0, &visitedPage, candidates);
     }
 
-    // Fallback sui player AVPlayer tracciati attivamente
+    // 2. Fallback sull'intera finestra attiva se il player video risiede in un fratello del layer overlay
+    if (candidates.count == 0) {
+        int visitedWin = 0;
+        FFBScanSubtreeForVideos(mainWin, mainWin, 0, &visitedWin, candidates);
+    }
+
+    // 3. Fallback sui player AVPlayer tracciati attivamente
     if (candidates.count == 0) {
         os_unfair_lock_lock(&gPlayerTrackLock);
         NSArray<AVPlayer *> *players = gTrackedAVPlayers ? gTrackedAVPlayers.allObjects : @[];
@@ -542,13 +578,7 @@ static FFBMediaCandidate *FFBFindActiveVideoOnScreen(UIView * _Nullable excluded
         }
     }
 
-    if (candidates.count == 0) {
-        if (excludedSheetSubtree != nil && gRecentActiveVideoCandidate &&
-            (CFAbsoluteTimeGetCurrent() - gRecentActiveVideoCandidate.capturedAt) < 20.0) {
-            return gRecentActiveVideoCandidate;
-        }
-        return nil;
-    }
+    if (candidates.count == 0) return nil;
 
     [candidates sortUsingComparator:^NSComparisonResult(FFBMediaCandidate *a, FFBMediaCandidate *b) {
         if (a.screenAreaScore > b.screenAreaScore) return NSOrderedAscending;
@@ -565,12 +595,11 @@ static FFBMediaCandidate *FFBFindActiveVideoOnScreen(UIView * _Nullable excluded
             }
         }
     }
-    gRecentActiveVideoCandidate = best;
     return best;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 3. Downloader MP4 + HLS (.m3u8 fMP4/TS) + Muxing Automatico Audio/Video DASH
+// 3. Download MP4 + HLS (.m3u8 fMP4/TS) + Muxing Automatico Audio/Video DASH
 // ─────────────────────────────────────────────────────────────────────────────
 
 static NSData *FFBSyncFetchURL(NSURL *url, NSString * _Nullable byteRange) {
@@ -889,8 +918,8 @@ static NSURL *FFBExportAVAssetDirectlyToMP4(AVAsset *asset) {
     return nil;
 }
 
-static NSURL *FFBDownloadOrExportCandidateToLocalMP4(FFBMediaCandidate *cand, BOOL preferSD) {
-    NSURL *videoURL = (preferSD && cand.sdVideoURL) ? cand.sdVideoURL : (cand.hdVideoURL ?: cand.sdVideoURL);
+static NSURL *FFBDownloadOrExportCandidateToLocalMP4(FFBMediaCandidate *cand) {
+    NSURL *videoURL = cand.hdVideoURL ?: cand.sdVideoURL;
     NSURL *separateAudioURL = cand.separateAudioURL;
     AVAsset *asset = cand.avAsset;
 
@@ -915,7 +944,6 @@ static NSURL *FFBDownloadOrExportCandidateToLocalMP4(FFBMediaCandidate *cand, BO
                                      [NSString stringWithFormat:@"FocusFB_Video_%@.mp4", [NSUUID UUID].UUIDString]];
                 NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
                 if ([raw writeToURL:tmpURL atomically:YES]) {
-                    // Se il flusso DASH scaricato non contiene traccia audio e abbiamo l'URL audio separato, uniscili!
                     AVURLAsset *downloadedAsset = [AVURLAsset URLAssetWithURL:tmpURL options:nil];
                     if ([downloadedAsset tracksWithMediaType:AVMediaTypeAudio].count == 0 && separateAudioURL) {
                         NSData *audData = FFBSyncFetchURL(separateAudioURL, nil);
@@ -980,16 +1008,12 @@ static NSURL *FFBDownloadOrExportCandidateToLocalMP4(FFBMediaCandidate *cand, BO
     return nil;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 4. Salvataggio nel Rullino iOS (PHPhotoLibrary + Fallback Share Sheet)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void FFBPresentShareSheetForItem(id item) {
-    if (!item) return;
+static void FFBPresentShareSheetFallback(NSURL *fileURL) {
+    if (!fileURL) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIViewController *top = FocusFBTopMostViewController();
         if (!top) return;
-        UIActivityViewController *act = [[UIActivityViewController alloc] initWithActivityItems:@[item]
+        UIActivityViewController *act = [[UIActivityViewController alloc] initWithActivityItems:@[fileURL]
                                                                           applicationActivities:nil];
         if (act.popoverPresentationController) {
             act.popoverPresentationController.sourceView = top.view;
@@ -999,20 +1023,23 @@ static void FFBPresentShareSheetForItem(id item) {
     });
 }
 
-static void FFBSaveLocalVideoFileToCameraRoll(NSURL *localVideoURL, BOOL shareInstead) {
+static void FFBSaveLocalVideoToPhotos(NSURL *localVideoURL, void (^ _Nullable onCompleted)(BOOL savedOK)) {
     if (!localVideoURL) {
         FocusFBShowToast(FFBLoc(@"DL.Failed"), @"exclamationmark.triangle.fill");
+        if (onCompleted) onCompleted(NO);
         return;
     }
-    if (shareInstead || !NSClassFromString(@"PHPhotoLibrary") || !NSClassFromString(@"PHAssetChangeRequest")) {
-        FFBPresentShareSheetForItem(localVideoURL);
+    if (!NSClassFromString(@"PHPhotoLibrary") || !NSClassFromString(@"PHAssetChangeRequest")) {
+        FFBPresentShareSheetFallback(localVideoURL);
+        if (onCompleted) onCompleted(YES);
         return;
     }
 
     @try {
         [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus status) {
             if (status != PHAuthorizationStatusAuthorized && status != PHAuthorizationStatusLimited) {
-                FFBPresentShareSheetForItem(localVideoURL);
+                FFBPresentShareSheetFallback(localVideoURL);
+                if (onCompleted) dispatch_async(dispatch_get_main_queue(), ^{ onCompleted(YES); });
                 return;
             }
 
@@ -1025,6 +1052,7 @@ static void FFBSaveLocalVideoFileToCameraRoll(NSURL *localVideoURL, BOOL shareIn
                         UINotificationFeedbackGenerator *gen = [[UINotificationFeedbackGenerator alloc] init];
                         [gen notificationOccurred:UINotificationFeedbackTypeSuccess];
                         FocusFBShowToast(FFBLoc(@"DL.SavedVideo"), @"checkmark.circle.fill");
+                        if (onCompleted) onCompleted(YES);
                     });
                 } else {
                     NSURL *remuxed = FFBRemuxOrMergeToStandardMP4(localVideoURL, nil);
@@ -1039,524 +1067,561 @@ static void FFBSaveLocalVideoFileToCameraRoll(NSURL *localVideoURL, BOOL shareIn
                                     UINotificationFeedbackGenerator *gen = [[UINotificationFeedbackGenerator alloc] init];
                                     [gen notificationOccurred:UINotificationFeedbackTypeSuccess];
                                     FocusFBShowToast(FFBLoc(@"DL.SavedVideo"), @"checkmark.circle.fill");
+                                    if (onCompleted) onCompleted(YES);
                                 });
                             } else {
-                                FFBPresentShareSheetForItem(remuxed);
+                                FFBPresentShareSheetFallback(remuxed);
+                                if (onCompleted) dispatch_async(dispatch_get_main_queue(), ^{ onCompleted(YES); });
                             }
                         }];
                     } else {
-                        FFBPresentShareSheetForItem(localVideoURL);
+                        FFBPresentShareSheetFallback(localVideoURL);
+                        if (onCompleted) dispatch_async(dispatch_get_main_queue(), ^{ onCompleted(YES); });
                     }
                 }
             }];
         }];
     } @catch (__unused NSException *ex) {
-        FFBPresentShareSheetForItem(localVideoURL);
+        FFBPresentShareSheetFallback(localVideoURL);
+        if (onCompleted) onCompleted(NO);
     }
 }
 
-static void FFBPerformCandidateDownload(FFBMediaCandidate *cand, BOOL preferSD, BOOL shareInstead) {
+// ─────────────────────────────────────────────────────────────────────────────
+// 4. Pulsante Download Nativo Sopra l'Icona "Mi piace" nei Reels
+// ─────────────────────────────────────────────────────────────────────────────
+
+@interface FFBInlineReelDownloadButton : UIButton
+@property (nonatomic, weak, nullable) UIView *reelPageView;
+- (void)playDownloadingState:(BOOL)active;
+- (void)flashCompletedCheckmark;
+@end
+
+@implementation FFBInlineReelDownloadButton
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.tag = kFFBInlineReelDownloadBtnTag;
+        self.backgroundColor = [UIColor clearColor];
+        self.adjustsImageWhenHighlighted = NO;
+        [self setImage:FFBReelOutlineDownloadImage() forState:UIControlStateNormal];
+        self.contentMode = UIViewContentModeCenter;
+
+        // Stessa ombra morbida delle icone bianche Mi piace / Commenta / Condividi / Salva dei Reels
+        self.layer.shadowColor = [UIColor blackColor].CGColor;
+        self.layer.shadowOpacity = 0.44f;
+        self.layer.shadowRadius = 2.6f;
+        self.layer.shadowOffset = CGSizeMake(0.0, 1.0);
+
+        [self addTarget:self action:@selector(onTouchDownAnim) forControlEvents:UIControlEventTouchDown];
+        [self addTarget:self action:@selector(onTouchResetAnim) forControlEvents:UIControlEventTouchCancel | UIControlEventTouchDragExit];
+        [self addTarget:self action:@selector(onDownloadTapped) forControlEvents:UIControlEventTouchUpInside];
+    }
+    return self;
+}
+
+- (void)onTouchDownAnim {
+    [UIView animateWithDuration:0.10 animations:^{
+        self.transform = CGAffineTransformMakeScale(0.86, 0.86);
+        self.alpha = 0.78;
+    }];
+}
+
+- (void)onTouchResetAnim {
+    [UIView animateWithDuration:0.16 animations:^{
+        self.transform = CGAffineTransformIdentity;
+        self.alpha = 1.0;
+    }];
+}
+
+- (void)playDownloadingState:(BOOL)active {
+    [self.layer removeAnimationForKey:@"ffb_pulse"];
+    if (active) {
+        CABasicAnimation *pulse = [CABasicAnimation animationWithKeyPath:@"opacity"];
+        pulse.fromValue = @(1.0);
+        pulse.toValue = @(0.38);
+        pulse.duration = 0.55;
+        pulse.autoreverses = YES;
+        pulse.repeatCount = HUGE_VALF;
+        [self.layer addAnimation:pulse forKey:@"ffb_pulse"];
+    } else {
+        self.layer.opacity = 1.0f;
+    }
+}
+
+- (void)flashCompletedCheckmark {
+    [self playDownloadingState:NO];
+    [self setImage:FFBReelOutlineCheckmarkImage() forState:UIControlStateNormal];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self setImage:FFBReelOutlineDownloadImage() forState:UIControlStateNormal];
+    });
+}
+
+- (void)onDownloadTapped {
+    [self onTouchResetAnim];
     if (gDownloadInFlight) return;
+
+    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
+    [gen impactOccurred];
+
+    FFBMediaCandidate *cand = FFBFindBestCandidateForReelScope(self.reelPageView);
     if (!cand || ![cand hasUsableVideo]) {
         FocusFBShowToast(FFBLoc(@"DL.NotFound"), @"info.circle.fill");
         return;
     }
 
     gDownloadInFlight = YES;
+    [self playDownloadingState:YES];
     FocusFBShowToast(FFBLoc(@"DL.Downloading"), @"arrow.down.circle.fill");
 
+    __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSURL *localMP4 = FFBDownloadOrExportCandidateToLocalMP4(cand, preferSD);
+        NSURL *localMP4 = FFBDownloadOrExportCandidateToLocalMP4(cand);
         dispatch_async(dispatch_get_main_queue(), ^{
             gDownloadInFlight = NO;
-            FFBSaveLocalVideoFileToCameraRoll(localMP4, shareInstead);
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            [strongSelf playDownloadingState:NO];
+            FFBSaveLocalVideoToPhotos(localMP4, ^(BOOL savedOK) {
+                if (savedOK) {
+                    [weakSelf flashCompletedCheckmark];
+                }
+            });
         });
     });
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// 5. Barra "Scarica video" Integrata nel Menu Condividi / Opzioni di Facebook
-//    (Quando fai long-press su un Reel o tocchi Condividi / ••• su Reel o Video!)
-// ─────────────────────────────────────────────────────────────────────────────
-
-@interface FFBShareSheetDownloadBar : UIView
-@property (nonatomic, strong, nullable) FFBMediaCandidate *videoCandidate;
-@property (nonatomic, weak, nullable) UIView *trackedSheetCard;
-- (void)updatePositionRelativeToSheetCard;
 @end
 
-@implementation FFBShareSheetDownloadBar {
-    UIVisualEffectView *_blurView;
-    UIButton *_mainDownloadBtn;
-    UIButton *_shareFileBtn;
-}
-
-- (instancetype)initWithFrame:(CGRect)frame {
-    self = [super initWithFrame:frame];
-    if (self) {
-        self.tag = kFFBShareSheetBarTag;
-        self.backgroundColor = [UIColor clearColor];
-
-        _blurView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterialDark]];
-        _blurView.frame = self.bounds;
-        _blurView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        _blurView.layer.cornerRadius = 16.0;
-        _blurView.layer.borderWidth = 0.8;
-        _blurView.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.20].CGColor;
-        _blurView.clipsToBounds = YES;
-        [self addSubview:_blurView];
-
-        _mainDownloadBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        _mainDownloadBtn.translatesAutoresizingMaskIntoConstraints = NO;
-        _mainDownloadBtn.tintColor = [UIColor whiteColor];
-        _mainDownloadBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
-        _mainDownloadBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 16, 0, 10);
-
-        UIImageSymbolConfiguration *symCfg = [UIImageSymbolConfiguration configurationWithPointSize:18.0 weight:UIImageSymbolWeightBold];
-        UIImage *dlIcon = [UIImage systemImageNamed:@"arrow.down.circle.fill" withConfiguration:symCfg];
-        [_mainDownloadBtn setImage:dlIcon forState:UIControlStateNormal];
-
-        NSString *labelText = [NSString stringWithFormat:@"  %@  •  %@",
-                               FFBLoc(@"DL.ShareBarAction"),
-                               FFBLoc(@"DL.ShareBarSub")];
-        [_mainDownloadBtn setTitle:labelText forState:UIControlStateNormal];
-        _mainDownloadBtn.titleLabel.font = [UIFont systemFontOfSize:15.5 weight:UIFontWeightSemibold];
-        _mainDownloadBtn.titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        [_mainDownloadBtn addTarget:self action:@selector(handleMainDownloadTap) forControlEvents:UIControlEventTouchUpInside];
-
-        _shareFileBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        _shareFileBtn.translatesAutoresizingMaskIntoConstraints = NO;
-        _shareFileBtn.tintColor = [UIColor colorWithWhite:0.92 alpha:1.0];
-        UIImageSymbolConfiguration *shareCfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightSemibold];
-        [_shareFileBtn setImage:[UIImage systemImageNamed:@"square.and.arrow.up" withConfiguration:shareCfg]
-                       forState:UIControlStateNormal];
-        [_shareFileBtn addTarget:self action:@selector(handleShareFileTap) forControlEvents:UIControlEventTouchUpInside];
-
-        UIView *divider = [[UIView alloc] init];
-        divider.translatesAutoresizingMaskIntoConstraints = NO;
-        divider.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.15];
-
-        [_blurView.contentView addSubview:_mainDownloadBtn];
-        [_blurView.contentView addSubview:divider];
-        [_blurView.contentView addSubview:_shareFileBtn];
-
-        [NSLayoutConstraint activateConstraints:@[
-            [_mainDownloadBtn.leadingAnchor constraintEqualToAnchor:_blurView.contentView.leadingAnchor],
-            [_mainDownloadBtn.topAnchor constraintEqualToAnchor:_blurView.contentView.topAnchor],
-            [_mainDownloadBtn.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor],
-            [_mainDownloadBtn.trailingAnchor constraintEqualToAnchor:divider.leadingAnchor],
-
-            [divider.widthAnchor constraintEqualToConstant:0.8],
-            [divider.topAnchor constraintEqualToAnchor:_blurView.contentView.topAnchor constant:11.0],
-            [divider.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor constant:-11.0],
-            [divider.trailingAnchor constraintEqualToAnchor:_shareFileBtn.leadingAnchor],
-
-            [_shareFileBtn.widthAnchor constraintEqualToConstant:50.0],
-            [_shareFileBtn.trailingAnchor constraintEqualToAnchor:_blurView.contentView.trailingAnchor],
-            [_shareFileBtn.topAnchor constraintEqualToAnchor:_blurView.contentView.topAnchor],
-            [_shareFileBtn.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor],
-        ]];
-    }
-    return self;
-}
-
-// Impedisce al UITapGestureRecognizer dello sfondo oscurato di intercettare il tocco sul nostro pulsante
-- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)gestureRecognizer {
-    if (gestureRecognizer.view != self &&
-        gestureRecognizer.view != _mainDownloadBtn &&
-        gestureRecognizer.view != _shareFileBtn) {
-        return NO;
-    }
-    return [super gestureRecognizerShouldBegin:gestureRecognizer];
-}
-
-- (void)updatePositionRelativeToSheetCard {
-    UIView *host = self.superview;
-    UIView *card = self.trackedSheetCard;
-    if (!host || !card || !card.window || card.hidden || card.alpha <= 0.05) {
-        [self removeFromSuperview];
-        return;
-    }
-
-    CGRect cardRect = [card convertRect:card.bounds toView:host];
-    CGFloat hostW = CGRectGetWidth(host.bounds);
-    CGFloat hostH = CGRectGetHeight(host.bounds);
-    if (CGRectGetMinY(cardRect) >= hostH - 40.0 || CGRectGetWidth(cardRect) < 180.0) {
-        self.alpha = 0.0;
-        return;
-    }
-    self.alpha = 1.0;
-
-    CGFloat barH = 50.0;
-    CGFloat barW = MIN(hostW - 24.0, CGRectGetWidth(cardRect) - 16.0);
-    CGFloat barX = floor((hostW - barW) * 0.5);
-    CGFloat safeTop = host.safeAreaInsets.top > 0 ? host.safeAreaInsets.top : 50.0;
-
-    CGFloat desiredY = CGRectGetMinY(cardRect) - barH - 8.0;
-    if (desiredY < safeTop + 6.0) {
-        desiredY = safeTop + 6.0;
-    }
-    self.frame = CGRectMake(barX, desiredY, barW, barH);
-    [host bringSubviewToFront:self];
-}
-
-- (FFBMediaCandidate *)resolvedCandidateNow {
-    FFBMediaCandidate *fresh = FFBFindActiveVideoOnScreen(self.superview);
-    if (fresh && [fresh hasUsableVideo]) {
-        self.videoCandidate = fresh;
-        return fresh;
-    }
-    return self.videoCandidate;
-}
-
-- (void)handleMainDownloadTap {
-    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [gen impactOccurred];
-    FFBMediaCandidate *cand = [self resolvedCandidateNow];
-    FFBPerformCandidateDownload(cand, NO, NO);
-}
-
-- (void)handleShareFileTap {
-    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    [gen impactOccurred];
-    FFBMediaCandidate *cand = [self resolvedCandidateNow];
-    FFBPerformCandidateDownload(cand, NO, YES);
-}
-
+// Rilevamento geometrico della colonna destra dei pulsanti di Facebook Reels (Mi piace, Commenti, Condividi, Salva)
+@interface FFBActionSlotItem : NSObject
+@property (nonatomic, weak) UIView *view;
+@property (nonatomic, assign) CGRect rectInPage;
+@property (nonatomic, assign) BOOL isGlyphSized;
 @end
 
-// Riconosce il Bottom Sheet / Menu Condividi nativo di Facebook (CDSBottomSheet, MDSBottomSheet, FBBottomSheet, Bloks, UITransitionView)
-static UIView *FFBFindBottomSheetCardInContainer(UIView *container, UIWindow *win, NSUInteger depth) {
-    if (!container || depth > 8 || container.hidden || container.alpha <= 0.05) return nil;
-    if (container.tag == kFFBShareSheetBarTag || container.tag == kFFBQuickDownloadBtnTag) return nil;
+@implementation FFBActionSlotItem
+@end
 
-    CGFloat winW = CGRectGetWidth(win.bounds);
-    CGFloat winH = CGRectGetHeight(win.bounds);
-    CGRect r = [container convertRect:container.bounds toView:win];
+static void FFBCollectRightEdgeActionViews(UIView *node,
+                                           UIView *reelPage,
+                                           CGFloat pageW,
+                                           CGFloat pageH,
+                                           NSUInteger depth,
+                                           int *visited,
+                                           NSMutableArray<FFBActionSlotItem *> *glyphItems,
+                                           NSMutableArray<FFBActionSlotItem *> *boxItems) {
+    if (!node || depth > 30 || *visited > 2200) return;
+    if (node.hidden || node.alpha <= 0.05 || node.tag == kFFBInlineReelDownloadBtnTag) return;
+    (*visited)++;
 
-    // Escludi schede di FocusFB, alert di sistema e barra tab inferiore (<= 110pt)
-    NSString *clsName = NSStringFromClass(object_getClass(container)) ?: @"";
-    if ([clsName hasPrefix:@"FocusFB"] || [clsName hasPrefix:@"FFB"] || [clsName containsString:@"AlertController"]) {
-        return nil;
-    }
+    if (node != reelPage) {
+        CGRect r = [node convertRect:node.bounds toView:reelPage];
+        CGFloat w = CGRectGetWidth(r);
+        CGFloat h = CGRectGetHeight(r);
+        CGFloat midX = CGRectGetMidX(r);
+        CGFloat midY = CGRectGetMidY(r);
 
-    BOOL anchoredBottom = (CGRectGetMaxY(r) >= winH - 18.0);
-    BOOL wideEnough = (CGRectGetWidth(r) >= winW * 0.88);
-    CGFloat cardH = CGRectGetHeight(r);
-    BOOL sheetHeight = (CGRectGetMinY(r) >= 48.0 && cardH >= 155.0 && cardH <= winH - 48.0);
-
-    if (depth >= 1 && anchoredBottom && wideEnough && sheetHeight) {
-        BOOL hasCardVisuals = (container.backgroundColor != nil && CGColorGetAlpha(container.backgroundColor.CGColor) > 0.35) ||
-                              container.layer.cornerRadius >= 8.0 ||
-                              container.clipsToBounds ||
-                              [clsName containsString:@"Sheet"] ||
-                              [clsName containsString:@"Drawer"] ||
-                              [clsName containsString:@"Modal"];
-        if (hasCardVisuals) {
-            return container;
-        }
-    }
-
-    for (UIView *sub in [container.subviews reverseObjectEnumerator]) {
-        UIView *found = FFBFindBottomSheetCardInContainer(sub, win, depth + 1);
-        if (found) return found;
-    }
-    return nil;
-}
-
-static BOOL FFBViewLooksLikeDimmedBackdrop(UIView *v, UIWindow *win) {
-    if (!v || v.hidden || v.alpha <= 0.05) return NO;
-    CGRect r = [v convertRect:v.bounds toView:win];
-    if (CGRectGetWidth(r) < CGRectGetWidth(win.bounds) * 0.92 ||
-        CGRectGetHeight(r) < CGRectGetHeight(win.bounds) * 0.92) {
-        return NO;
-    }
-    if (v.backgroundColor) {
-        CGFloat red = 0, green = 0, blue = 0, alpha = 0;
-        if ([v.backgroundColor getRed:&red green:&green blue:&blue alpha:&alpha]) {
-            CGFloat effAlpha = alpha * v.alpha;
-            if (red < 0.25 && green < 0.25 && blue < 0.28 && effAlpha >= 0.12 && effAlpha <= 0.90) {
-                return YES;
+        // Fascia destra dei Reels (sotto la barra superiore "Reels / Lente / •••", sopra la tab bar)
+        if (midX >= pageW - 66.0 && midX <= pageW - 10.0 &&
+            midY >= pageH * 0.30 && midY <= pageH - 18.0) {
+            if (w >= 16.0 && w <= 38.0 && h >= 16.0 && h <= 38.0 &&
+                ![node isKindOfClass:UILabel.class] &&
+                (w / h) >= 0.62 && (w / h) <= 1.60) {
+                FFBActionSlotItem *it = [[FFBActionSlotItem alloc] init];
+                it.view = node;
+                it.rectInPage = r;
+                it.isGlyphSized = YES;
+                [glyphItems addObject:it];
+            } else if (w >= 34.0 && w <= 78.0 && h >= 34.0 && h <= 82.0) {
+                FFBActionSlotItem *it = [[FFBActionSlotItem alloc] init];
+                it.view = node;
+                it.rectInPage = r;
+                it.isGlyphSized = NO;
+                [boxItems addObject:it];
             }
         }
     }
-    NSString *cls = NSStringFromClass(object_getClass(v)) ?: @"";
-    return ([cls containsString:@"Dimming"] ||
-            [cls containsString:@"Backdrop"] ||
-            [cls containsString:@"Scrim"]);
+
+    for (UIView *sub in node.subviews) {
+        FFBCollectRightEdgeActionViews(sub, reelPage, pageW, pageH, depth + 1, visited, glyphItems, boxItems);
+    }
 }
 
-static UIViewController *FFBFindSheetControllerInTree(UIViewController *vc, NSUInteger depth) {
-    if (!vc || depth > 12 || vc.isBeingDismissed) return nil;
-    if (vc.presentedViewController && !vc.presentedViewController.isBeingDismissed) {
-        UIViewController *foundPres = FFBFindSheetControllerInTree(vc.presentedViewController, depth + 1);
-        if (foundPres) return foundPres;
-    }
-    for (UIViewController *child in [vc.childViewControllers reverseObjectEnumerator]) {
-        UIViewController *foundChild = FFBFindSheetControllerInTree(child, depth + 1);
-        if (foundChild) return foundChild;
-    }
+static NSArray<FFBActionSlotItem *> *FFBExtractBestAlignedColumn(NSArray<FFBActionSlotItem *> *rawItems) {
+    if (rawItems.count < 3) return @[];
 
-    if ([vc isKindOfClass:FocusFBSettingsViewController.class] ||
-        [vc isKindOfClass:UIAlertController.class] ||
-        [vc isKindOfClass:UIActivityViewController.class]) {
-        return nil;
-    }
-    NSString *cls = NSStringFromClass(vc.class) ?: @"";
-    if ([cls hasPrefix:@"FocusFB"] || [cls hasPrefix:@"FFB"]) return nil;
+    // 1. Deduplica elementi sovrapposti (entro 22pt verticali e 12pt orizzontali)
+    NSArray<FFBActionSlotItem *> *sorted = [rawItems sortedArrayUsingComparator:^NSComparisonResult(FFBActionSlotItem *a, FFBActionSlotItem *b) {
+        CGFloat ay = CGRectGetMidY(a.rectInPage);
+        CGFloat by = CGRectGetMidY(b.rectInPage);
+        if (ay < by) return NSOrderedAscending;
+        if (ay > by) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
 
-    if (vc.isViewLoaded && !vc.view.hidden && vc.view.alpha > 0.05 && vc.view.window != nil) {
-        if ([cls containsString:@"BottomSheet"] ||
-            [cls containsString:@"ActionSheet"] ||
-            [cls containsString:@"ShareSheet"] ||
-            [cls containsString:@"Popover"] ||
-            [cls containsString:@"Drawer"] ||
-            (vc.presentingViewController != nil && depth >= 1)) {
-            return vc;
-        }
-    }
-    return nil;
-}
-
-static BOOL FFBScanViewTreeForModalBottomSheet(UIView *node,
-                                               UIWindow *win,
-                                               NSUInteger depth,
-                                               UIView * _Nullable *outHost,
-                                               UIView * _Nullable *outCard) {
-    if (!node || depth > 9 || node.hidden || node.alpha <= 0.05) return NO;
-    NSString *cls = NSStringFromClass(object_getClass(node)) ?: @"";
-    if ([cls hasPrefix:@"FocusFB"] || [cls hasPrefix:@"FFB"]) return NO;
-
-    CGRect r = [node convertRect:node.bounds toView:win];
-    if (CGRectGetWidth(r) < CGRectGetWidth(win.bounds) * 0.90 ||
-        CGRectGetHeight(r) < CGRectGetHeight(win.bounds) * 0.85) {
-        return NO;
-    }
-
-    // Controlla prima i figli più profondi (l'ultimo overlay modale aggiunto sopra il contenuto)
-    for (UIView *sub in [node.subviews reverseObjectEnumerator]) {
-        if (FFBScanViewTreeForModalBottomSheet(sub, win, depth + 1, outHost, outCard)) {
-            return YES;
-        }
-    }
-
-    BOOL hasBackdrop = FFBViewLooksLikeDimmedBackdrop(node, win);
-    if (!hasBackdrop) {
-        for (UIView *sub in node.subviews) {
-            if (FFBViewLooksLikeDimmedBackdrop(sub, win)) {
-                hasBackdrop = YES;
+    NSMutableArray<FFBActionSlotItem *> *dedup = [NSMutableArray array];
+    for (FFBActionSlotItem *cand in sorted) {
+        BOOL merged = NO;
+        for (NSUInteger i = 0; i < dedup.count; i++) {
+            FFBActionSlotItem *ex = dedup[i];
+            if (fabs(CGRectGetMidY(cand.rectInPage) - CGRectGetMidY(ex.rectInPage)) < 24.0 &&
+                fabs(CGRectGetMidX(cand.rectInPage) - CGRectGetMidX(ex.rectInPage)) < 14.0) {
+                // Preferisci il glifo più vicino a 25x25pt (dimensione esatta delle icone Reels)
+                CGFloat candDiff = fabs(CGRectGetWidth(cand.rectInPage) - 25.0) + fabs(CGRectGetHeight(cand.rectInPage) - 25.0);
+                CGFloat exDiff = fabs(CGRectGetWidth(ex.rectInPage) - 25.0) + fabs(CGRectGetHeight(ex.rectInPage) - 25.0);
+                if (candDiff < exDiff) {
+                    dedup[i] = cand;
+                }
+                merged = YES;
                 break;
             }
         }
-    }
-    BOOL namedModal = ([cls containsString:@"TransitionView"] ||
-                       [cls containsString:@"BottomSheet"] ||
-                       [cls containsString:@"Modal"] ||
-                       [cls containsString:@"Sheet"] ||
-                       [cls containsString:@"Drawer"]);
-
-    if (hasBackdrop || namedModal) {
-        UIView *card = FFBFindBottomSheetCardInContainer(node, win, 0);
-        if (card) {
-            UIView *host = (card == node && node.superview) ? node.superview : node;
-            if (outHost) *outHost = host;
-            if (outCard) *outCard = card;
-            return YES;
+        if (!merged) {
+            [dedup addObject:cand];
         }
     }
-    return NO;
+
+    if (dedup.count < 3) return @[];
+
+    // 2. Trova la colonna verticale di almeno 3 icone con lo stesso centro X (±8pt) e passo regolare (42..98pt)
+    NSArray<FFBActionSlotItem *> *bestChain = @[];
+    for (NSUInteger i = 0; i < dedup.count; i++) {
+        FFBActionSlotItem *seed = dedup[i];
+        CGFloat refX = CGRectGetMidX(seed.rectInPage);
+        NSMutableArray<FFBActionSlotItem *> *chain = [NSMutableArray arrayWithObject:seed];
+        FFBActionSlotItem *prev = seed;
+
+        for (NSUInteger j = i + 1; j < dedup.count; j++) {
+            FFBActionSlotItem *cur = dedup[j];
+            if (fabs(CGRectGetMidX(cur.rectInPage) - refX) > 8.5) continue;
+            CGFloat dy = CGRectGetMidY(cur.rectInPage) - CGRectGetMidY(prev.rectInPage);
+            if (dy >= 40.0 && dy <= 102.0) {
+                [chain addObject:cur];
+                prev = cur;
+            }
+        }
+        if (chain.count > bestChain.count) {
+            bestChain = chain;
+        }
+    }
+
+    return (bestChain.count >= 3) ? bestChain : @[];
 }
 
-static BOOL FFBDetectOpenFacebookBottomSheet(UIView * _Nullable *outHostContainer,
-                                             UIView * _Nullable *outSheetCard) {
-    if (outHostContainer) *outHostContainer = nil;
-    if (outSheetCard) *outSheetCard = nil;
-
-    for (UIScene *scene in UIApplication.sharedApplication.connectedScenes) {
-        if (![scene isKindOfClass:UIWindowScene.class]) continue;
-        UIWindowScene *ws = (UIWindowScene *)scene;
-        if (ws.activationState != UISceneActivationStateForegroundActive) continue;
-
-        for (UIWindow *win in [ws.windows reverseObjectEnumerator]) {
-            if (win.hidden || win.alpha <= 0.05) continue;
-            NSString *rootCls = win.rootViewController ? NSStringFromClass(win.rootViewController.class) : @"";
-            if ([rootCls hasPrefix:@"FocusFB"] || [rootCls hasPrefix:@"FFB"] ||
-                [win.rootViewController isKindOfClass:UIAlertController.class] ||
-                [win.rootViewController isKindOfClass:UIActivityViewController.class]) {
-                continue;
-            }
-
-            // 1. Ricerca nel grafo dei UIViewController (sia presented sia child sheet controller!)
-            UIViewController *sheetVC = FFBFindSheetControllerInTree(win.rootViewController, 0);
-            if (sheetVC && sheetVC.isViewLoaded && sheetVC.view.window == win) {
-                UIView *searchRoot = (CGRectGetMinY([sheetVC.view convertRect:sheetVC.view.bounds toView:win]) > 40.0 && sheetVC.view.superview)
-                                     ? sheetVC.view.superview
-                                     : sheetVC.view;
-                UIView *card = FFBFindBottomSheetCardInContainer(searchRoot, win, 0);
-                if (card) {
-                    UIView *host = (card == searchRoot && searchRoot.superview) ? searchRoot.superview : searchRoot;
-                    if (outHostContainer) *outHostContainer = host;
-                    if (outSheetCard) *outSheetCard = card;
-                    return YES;
+static UIView *FFBChooseInteractiveHostInReelPage(UIView *likeView,
+                                                  UIView *reelPage,
+                                                  CGRect btnRectInPage) {
+    UIView *cur = likeView.superview;
+    while (cur != nil) {
+        if (cur.userInteractionEnabled && !cur.hidden && cur.alpha > 0.10) {
+            CGRect rectInCur = [reelPage convertRect:btnRectInPage toView:cur];
+            if (CGRectContainsRect(CGRectInset(cur.bounds, -1.0, -1.0), rectInCur)) {
+                BOOL ancestorsValid = YES;
+                for (UIView *anc = cur; anc != nil; anc = anc.superview) {
+                    if (!anc.userInteractionEnabled || anc.hidden || anc.alpha <= 0.05) {
+                        ancestorsValid = NO;
+                        break;
+                    }
+                    CGRect rectInAnc = [reelPage convertRect:btnRectInPage toView:anc];
+                    if (!CGRectContainsRect(CGRectInset(anc.bounds, -2.0, -2.0), rectInAnc)) {
+                        ancestorsValid = NO;
+                        break;
+                    }
+                    if (anc == reelPage) break;
+                }
+                if (ancestorsValid) {
+                    return cur;
                 }
             }
+        }
+        if (cur == reelPage) break;
+        cur = cur.superview;
+    }
+    return reelPage.userInteractionEnabled ? reelPage : nil;
+}
 
-            // 2. Ricerca gerarchica profonda per bottom sheet React Native / Bloks / ComponentKit montati come UIView
-            UIView *vHost = nil;
-            UIView *vCard = nil;
-            if (FFBScanViewTreeForModalBottomSheet(win, win, 0, &vHost, &vCard) && vHost && vCard) {
-                if (outHostContainer) *outHostContainer = vHost;
-                if (outSheetCard) *outSheetCard = vCard;
+static void FFBAttachOrAlignDownloadButtonInReelPage(UIView *reelPage) {
+    if (!reelPage || reelPage.hidden || reelPage.alpha <= 0.05 || !reelPage.window) return;
+
+    CGFloat pageW = CGRectGetWidth(reelPage.bounds);
+    CGFloat pageH = CGRectGetHeight(reelPage.bounds);
+    if (pageW < 260.0 || pageH < 420.0) return;
+
+    // Assicurati che questa pagina contenga effettivamente una superficie video
+    if (!FFBSubtreeContainsAnyVideoSurface(reelPage, 0)) {
+        UIView *stale = [reelPage viewWithTag:kFFBInlineReelDownloadBtnTag];
+        if (stale) [stale removeFromSuperview];
+        return;
+    }
+
+    NSMutableArray<FFBActionSlotItem *> *glyphs = [NSMutableArray array];
+    NSMutableArray<FFBActionSlotItem *> *boxes = [NSMutableArray array];
+    int visited = 0;
+    FFBCollectRightEdgeActionViews(reelPage, reelPage, pageW, pageH, 0, &visited, glyphs, boxes);
+
+    NSArray<FFBActionSlotItem *> *col = FFBExtractBestAlignedColumn(glyphs);
+    if (col.count < 3) {
+        col = FFBExtractBestAlignedColumn(boxes);
+    }
+    if (col.count < 3) return;
+
+    FFBActionSlotItem *likeSlot = col[0];
+    FFBActionSlotItem *commentSlot = col[1];
+    if (!likeSlot.view) return;
+
+    CGFloat likeCenterX = CGRectGetMidX(likeSlot.rectInPage);
+    CGFloat likeIconCenterY = likeSlot.isGlyphSized
+                              ? CGRectGetMidY(likeSlot.rectInPage)
+                              : (CGRectGetMinY(likeSlot.rectInPage) + 15.0);
+    CGFloat commentIconCenterY = commentSlot.isGlyphSized
+                                 ? CGRectGetMidY(commentSlot.rectInPage)
+                                 : (CGRectGetMinY(commentSlot.rectInPage) + 15.0);
+
+    CGFloat rawStepY = commentIconCenterY - likeIconCenterY;
+    CGFloat clampedStepY = MAX(52.0, MIN(82.0, rawStepY));
+
+    // Posiziona l'icona di download sopra l'icona Mi piace con la stessa distanza visiva delle altre icone
+    CGFloat targetCenterY = likeIconCenterY - round(clampedStepY * 0.85);
+    if (targetCenterY < 96.0) return; // Non sovrapporre mai la barra in alto ("Reels / Lente / •••")
+
+    CGFloat hitSize = 48.0;
+    CGRect btnRectInPage = CGRectMake(round(likeCenterX - hitSize * 0.5),
+                                      round(targetCenterY - hitSize * 0.5),
+                                      hitSize,
+                                      hitSize);
+
+    UIView *hostView = FFBChooseInteractiveHostInReelPage(likeSlot.view, reelPage, btnRectInPage);
+    if (!hostView) return;
+
+    CGRect btnRectInHost = [reelPage convertRect:btnRectInPage toView:hostView];
+
+    FFBInlineReelDownloadButton *existingBtn = (FFBInlineReelDownloadButton *)[reelPage viewWithTag:kFFBInlineReelDownloadBtnTag];
+    if (existingBtn && existingBtn.superview != hostView) {
+        [existingBtn removeFromSuperview];
+        existingBtn = nil;
+    }
+
+    if (!existingBtn) {
+        existingBtn = [[FFBInlineReelDownloadButton alloc] initWithFrame:btnRectInHost];
+        existingBtn.reelPageView = reelPage;
+        [hostView addSubview:existingBtn];
+        if (!gMountedReelButtons) {
+            gMountedReelButtons = [NSHashTable weakObjectsHashTable];
+        }
+        [gMountedReelButtons addObject:existingBtn];
+    } else {
+        existingBtn.reelPageView = reelPage;
+        if (fabs(CGRectGetMidX(existingBtn.frame) - CGRectGetMidX(btnRectInHost)) > 0.5 ||
+            fabs(CGRectGetMidY(existingBtn.frame) - CGRectGetMidY(btnRectInHost)) > 0.5) {
+            existingBtn.frame = btnRectInHost;
+        }
+        [hostView bringSubviewToFront:existingBtn];
+    }
+}
+
+static void FFBRemoveAllMountedReelButtons(void) {
+    if (!gMountedReelButtons) return;
+    for (UIButton *btn in gMountedReelButtons.allObjects) {
+        [btn removeFromSuperview];
+    }
+    [gMountedReelButtons removeAllObjects];
+}
+
+static BOOL FFBCollectionViewLooksLikeReelsPager(UICollectionView *cv) {
+    if (!cv || cv.hidden || cv.alpha <= 0.05 || !cv.window) return NO;
+    CGFloat winW = CGRectGetWidth(cv.window.bounds);
+    CGFloat winH = CGRectGetHeight(cv.window.bounds);
+    if (CGRectGetWidth(cv.bounds) < winW * 0.88 || CGRectGetHeight(cv.bounds) < winH * 0.68) {
+        return NO;
+    }
+
+    NSNumber *cached = objc_getAssociatedObject(cv, &kIsReelsCollectionCacheKey);
+    if (cached != nil) {
+        return cached.boolValue;
+    }
+
+    UIResponder *resp = cv.nextResponder;
+    int hops = 0;
+    while (resp && hops < 10) {
+        if ([resp isKindOfClass:UIViewController.class]) {
+            NSString *cls = NSStringFromClass(((UIViewController *)resp).class).lowercaseString ?: @"";
+            if ([cls containsString:@"marketplace"] ||
+                [cls containsString:@"newsfeed"] ||
+                [cls containsString:@"mainfeed"]) {
+                objc_setAssociatedObject(cv, &kIsReelsCollectionCacheKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                return NO;
+            }
+            if ([cls containsString:@"reels"] ||
+                [cls containsString:@"shorts"] ||
+                [cls containsString:@"videohome"] ||
+                [cls containsString:@"unifiedplayer"] ||
+                [cls containsString:@"tahoe"] ||
+                [cls containsString:@"watch"]) {
+                objc_setAssociatedObject(cv, &kIsReelsCollectionCacheKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 return YES;
             }
         }
+        resp = resp.nextResponder;
+        hops++;
+    }
+
+    if (cv.isPagingEnabled && !cv.alwaysBounceHorizontal) {
+        objc_setAssociatedObject(cv, &kIsReelsCollectionCacheKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        return YES;
     }
     return NO;
 }
 
-static void FFBSyncShareSheetDownloadBar(void) {
+static void FFBFindVisibleReelContainersInTree(UIView *node,
+                                               UIWindow *win,
+                                               NSUInteger depth,
+                                               NSMutableArray<UIView *> *outPages) {
+    if (!node || depth > 14 || node.hidden || node.alpha <= 0.05) return;
+    if ([node isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)node;
+        if (FFBCollectionViewLooksLikeReelsPager(cv)) {
+            for (UICollectionViewCell *cell in cv.visibleCells) {
+                if (CGRectGetHeight(cell.bounds) >= CGRectGetHeight(win.bounds) * 0.65) {
+                    [outPages addObject:cell];
+                }
+            }
+            return;
+        }
+    }
+
+    // Fallback se il player Reels usa una UIScrollView paginata non-UICollectionView
+    if ([node isKindOfClass:UIScrollView.class] && ![node isKindOfClass:UICollectionView.class] && ![node isKindOfClass:UITableView.class]) {
+        UIScrollView *sv = (UIScrollView *)node;
+        if (sv.isPagingEnabled &&
+            CGRectGetWidth(sv.bounds) >= CGRectGetWidth(win.bounds) * 0.88 &&
+            CGRectGetHeight(sv.bounds) >= CGRectGetHeight(win.bounds) * 0.68) {
+            for (UIView *sub in sv.subviews) {
+                if (!sub.hidden && sub.alpha > 0.05 &&
+                    CGRectGetWidth(sub.bounds) >= CGRectGetWidth(win.bounds) * 0.88 &&
+                    CGRectGetHeight(sub.bounds) >= CGRectGetHeight(win.bounds) * 0.65) {
+                    CGRect rInWin = [sub convertRect:sub.bounds toView:win];
+                    CGRect inter = CGRectIntersection(rInWin, win.bounds);
+                    if (!CGRectIsNull(inter) && CGRectGetHeight(inter) >= 180.0) {
+                        [outPages addObject:sub];
+                    }
+                }
+            }
+            if (outPages.count > 0) return;
+        }
+    }
+
+    for (UIView *sub in node.subviews) {
+        FFBFindVisibleReelContainersInTree(sub, win, depth + 1, outPages);
+    }
+}
+
+void FocusFBMediaDownloaderOnScrollLayout(UIScrollView *scrollView) {
+    if (!gMediaDownloaderReady || !scrollView) return;
+
+    // Controllo istantaneo O(1): Marketplace e Feed non sono MAI pagingEnabled!
+    if ([scrollView isKindOfClass:UICollectionView.class]) {
+        UICollectionView *cv = (UICollectionView *)scrollView;
+        if (!FFBCollectionViewLooksLikeReelsPager(cv)) return;
+        FocusFBPrefs *prefs = [FocusFBPrefs shared];
+        if (!prefs.enabled || !prefs.enableMediaDownload) return;
+
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        for (UICollectionViewCell *cell in cv.visibleCells) {
+            if (CGRectGetHeight(cell.bounds) < 400.0) continue;
+            UIView *existing = [cell viewWithTag:kFFBInlineReelDownloadBtnTag];
+            NSNumber *lastSync = objc_getAssociatedObject(cell, &kLastCellBtnSyncTimeKey);
+            if (existing && existing.superview && lastSync && (now - lastSync.doubleValue) < 0.30) {
+                continue;
+            }
+            objc_setAssociatedObject(cell, &kLastCellBtnSyncTimeKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            FFBAttachOrAlignDownloadButtonInReelPage(cell);
+        }
+        return;
+    }
+
+    if (!scrollView.isPagingEnabled || scrollView.alwaysBounceHorizontal) return;
+    if (!scrollView.window || CGRectGetHeight(scrollView.bounds) < 420.0 || CGRectGetWidth(scrollView.bounds) < 260.0) return;
+
+    FocusFBPrefs *prefs = [FocusFBPrefs shared];
+    if (!prefs.enabled || !prefs.enableMediaDownload) return;
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSNumber *lastSVSync = objc_getAssociatedObject(scrollView, &kLastCellBtnSyncTimeKey);
+    if (lastSVSync && (now - lastSVSync.doubleValue) < 0.22) return;
+    objc_setAssociatedObject(scrollView, &kLastCellBtnSyncTimeKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    UIWindow *win = scrollView.window;
+    for (UIView *sub in scrollView.subviews) {
+        if (sub.hidden || sub.alpha <= 0.05) continue;
+        if (CGRectGetWidth(sub.bounds) >= CGRectGetWidth(win.bounds) * 0.88 &&
+            CGRectGetHeight(sub.bounds) >= CGRectGetHeight(win.bounds) * 0.65) {
+            CGRect rInWin = [sub convertRect:sub.bounds toView:win];
+            CGRect inter = CGRectIntersection(rInWin, win.bounds);
+            if (!CGRectIsNull(inter) && CGRectGetHeight(inter) >= 180.0) {
+                FFBAttachOrAlignDownloadButtonInReelPage(sub);
+            }
+        }
+    }
+}
+
+void FocusFBMediaDownloaderSyncUI(void) {
+    if (!gMediaDownloaderReady) return;
+    if (!NSThread.isMainThread) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            FocusFBMediaDownloaderSyncUI();
+        });
+        return;
+    }
+
     FocusFBPrefs *prefs = [FocusFBPrefs shared];
     if (!prefs.enabled || !prefs.enableMediaDownload) {
-        if (gShareSheetFollowTimer) {
-            [gShareSheetFollowTimer invalidate];
-            gShareSheetFollowTimer = nil;
+        FFBRemoveAllMountedReelButtons();
+        return;
+    }
+
+    UIWindow *win = FocusFBActiveWindow();
+    if (!win || !win.rootViewController || !win.rootViewController.isViewLoaded) return;
+
+    NSMutableArray<UIView *> *reelPages = [NSMutableArray array];
+    FFBFindVisibleReelContainersInTree(win.rootViewController.view, win, 0, reelPages);
+
+    // Se un player Reels full-screen è presentato modalmente sopra rootViewController
+    UIViewController *pres = win.rootViewController.presentedViewController;
+    while (pres && !pres.isBeingDismissed) {
+        if (pres.isViewLoaded && ![pres isKindOfClass:FocusFBSettingsViewController.class] &&
+            ![pres isKindOfClass:UIAlertController.class] &&
+            ![pres isKindOfClass:UIActivityViewController.class]) {
+            FFBFindVisibleReelContainersInTree(pres.view, win, 0, reelPages);
         }
+        pres = pres.presentedViewController;
+    }
+
+    for (UIView *page in reelPages) {
+        FFBAttachOrAlignDownloadButtonInReelPage(page);
+    }
+}
+
+static void FFBScheduleReelButtonSyncBurst(void) {
+    if (!gMediaDownloaderReady) return;
+    NSArray<NSNumber *> *delays = @[@(0.03), @(0.18), @(0.45)];
+    for (NSNumber *d in delays) {
+        double sec = d.doubleValue;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            FocusFBMediaDownloaderSyncUI();
+        });
+    }
+}
+
+void FocusFBNotifyMediaControllerTransition(UIViewController *vc) {
+    if (!gMediaDownloaderReady || !vc) return;
+    if ([vc isKindOfClass:FocusFBSettingsViewController.class] ||
+        [vc isKindOfClass:UIAlertController.class] ||
+        [vc isKindOfClass:UIActivityViewController.class]) {
         return;
     }
-
-    UIView *sheetHost = nil;
-    UIView *sheetCard = nil;
-    BOOL sheetOpen = FFBDetectOpenFacebookBottomSheet(&sheetHost, &sheetCard);
-
-    if (!sheetOpen || !sheetHost || !sheetCard) {
-        if (gShareSheetFollowTimer) {
-            [gShareSheetFollowTimer invalidate];
-            gShareSheetFollowTimer = nil;
-        }
-        return;
-    }
-
-    FFBShareSheetDownloadBar *existingBar = (FFBShareSheetDownloadBar *)[sheetHost viewWithTag:kFFBShareSheetBarTag];
-    if (existingBar) {
-        existingBar.trackedSheetCard = sheetCard;
-        [existingBar updatePositionRelativeToSheetCard];
-        return;
-    }
-
-    // Mostra la barra "Scarica video" SOLO se sotto al menu Condividi c'è effettivamente un Video / Reel / Storia Video!
-    FFBMediaCandidate *videoCand = FFBFindActiveVideoOnScreen(sheetHost);
-    if (!videoCand || ![videoCand hasUsableVideo]) {
-        return;
-    }
-
-    FFBShareSheetDownloadBar *bar = [[FFBShareSheetDownloadBar alloc] initWithFrame:CGRectMake(12, 100, 320, 50)];
-    bar.videoCandidate = videoCand;
-    bar.trackedSheetCard = sheetCard;
-    [sheetHost addSubview:bar];
-    [bar updatePositionRelativeToSheetCard];
-
-    if (!gShareSheetFollowTimer) {
-        gShareSheetFollowTimer = [NSTimer scheduledTimerWithTimeInterval:0.08
-                                                                 repeats:YES
-                                                                   block:^(NSTimer *timer) {
-            UIView *h = nil;
-            UIView *c = nil;
-            if (!FFBDetectOpenFacebookBottomSheet(&h, &c) || !h || !c) {
-                [timer invalidate];
-                if (gShareSheetFollowTimer == timer) {
-                    gShareSheetFollowTimer = nil;
-                }
-                return;
-            }
-            FFBShareSheetDownloadBar *b = (FFBShareSheetDownloadBar *)[h viewWithTag:kFFBShareSheetBarTag];
-            if (b) {
-                b.trackedSheetCard = c;
-                [b updatePositionRelativeToSheetCard];
-            }
-        }];
-    }
+    FFBScheduleReelButtonSyncBurst();
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 6. Pulsante Rapido Opzionale (Solo se attivato esplicitamente nelle impostazioni)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static BOOL FFBShouldShowOptionalQuickButtonNow(UIWindow *win) {
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled || !prefs.enableMediaDownload || !prefs.showMediaDownloadButton || !win) {
-        return NO;
-    }
-
-    UIViewController *top = FocusFBTopMostViewController();
-    if (!top) return NO;
-    if ([top isKindOfClass:FocusFBSettingsViewController.class] ||
-        [top.navigationController.viewControllers.firstObject isKindOfClass:FocusFBSettingsViewController.class] ||
-        [top isKindOfClass:UIAlertController.class] ||
-        [top isKindOfClass:UIActivityViewController.class]) {
-        return NO;
-    }
-
-    UIView *dummyHost = nil;
-    UIView *dummyCard = nil;
-    if (FFBDetectOpenFacebookBottomSheet(&dummyHost, &dummyCard)) {
-        return NO; // Quando è aperto il menu Condividi c'è già la barra integrata!
-    }
-
-    FFBMediaCandidate *videoCand = FFBFindActiveVideoOnScreen(nil);
-    if (!videoCand || ![videoCand hasUsableVideo]) {
-        return NO;
-    }
-
-    if (FocusFBIsStoryViewerVisibleNow()) {
-        return YES;
-    }
-
-    CGFloat minFullscreenArea = CGRectGetWidth(win.bounds) * (CGRectGetHeight(win.bounds) * 0.55);
-    return (videoCand.rawVisibleArea >= minFullscreenArea);
-}
-
-@interface FFBQuickVideoButtonTarget : NSObject
-+ (instancetype)shared;
-- (void)handleQuickTap:(UIButton *)sender;
-- (void)handleQuickPan:(UIPanGestureRecognizer *)pan;
-@end
-
-@implementation FFBQuickVideoButtonTarget
-
-+ (instancetype)shared {
-    static FFBQuickVideoButtonTarget *inst = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        inst = [[FFBQuickVideoButtonTarget alloc] init];
-    });
-    return inst;
-}
-
-- (void)handleQuickTap:(__unused UIButton *)sender {
-    UIImpactFeedbackGenerator *gen = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
-    [gen impactOccurred];
-    FFBMediaCandidate *cand = FFBFindActiveVideoOnScreen(nil);
-    FFBPerformCandidateDownload(cand, NO, NO);
-}
-
-- (void)handleQuickPan:(UIPanGestureRecognizer *)pan {
-    UIView *v = pan.view;
-    UIView *sup = v.superview;
-    if (!v || !sup) return;
-    CGPoint tr = [pan translationInView:sup];
-    CGPoint c = CGPointMake(v.center.x + tr.x, v.center.y + tr.y);
-    UIEdgeInsets ins = sup.safeAreaInsets;
-    c.x = MAX(28.0, MIN(CGRectGetWidth(sup.bounds) - 28.0, c.x));
-    c.y = MAX(ins.top + 36.0, MIN(CGRectGetHeight(sup.bounds) - ins.bottom - 70.0, c.y));
-    v.center = c;
-    [pan setTranslation:CGPointZero inView:sup];
-}
-
-@end
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 7. Hook Leggeri su AVPlayer e UIWindow + Sincronizzazione UI
-// ─────────────────────────────────────────────────────────────────────────────
 
 static void FFBHook_AVPlayer_replaceCurrentItem(id self, SEL _cmd, AVPlayerItem *item) {
     if (gOrigAVPlayerReplaceItem) {
@@ -1569,156 +1634,10 @@ static void FFBHook_AVPlayer_replaceCurrentItem(id self, SEL _cmd, AVPlayerItem 
         }
         [gTrackedAVPlayers addObject:(AVPlayer *)self];
         os_unfair_lock_unlock(&gPlayerTrackLock);
-    }
-}
 
-static void FFBScheduleShareSheetSyncBurst(void) {
-    if (!gMediaDownloaderReady) return;
-    NSArray<NSNumber *> *delays = @[@(0.02), @(0.12), @(0.30), @(0.60)];
-    for (NSNumber *d in delays) {
-        double sec = d.doubleValue;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(sec * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            FFBSyncShareSheetDownloadBar();
-        });
-    }
-}
-
-static void FFBHook_UIWindow_didAddSubview(id self, SEL _cmd, UIView *subview) {
-    if (gOrigWindowDidAddSubview) {
-        gOrigWindowDidAddSubview(self, _cmd, subview);
-    }
-    if (!gMediaDownloaderReady || !subview) return;
-    if (subview.tag == kFFBQuickDownloadBtnTag || subview.tag == kFFBShareSheetBarTag) return;
-
-    // Quando UIKit o Facebook aggiunge un UITransitionView o un overlay modale alla finestra,
-    // aggiorna subito l'eventuale pulsante "Scarica video" sul menu Condividi!
-    FFBScheduleShareSheetSyncBurst();
-}
-
-void FocusFBNotifyMediaControllerTransition(UIViewController *vc) {
-    if (!gMediaDownloaderReady || !vc) return;
-    if ([vc isKindOfClass:FocusFBSettingsViewController.class] ||
-        [vc isKindOfClass:UIAlertController.class] ||
-        [vc isKindOfClass:UIActivityViewController.class]) {
-        return;
-    }
-    FFBScheduleShareSheetSyncBurst();
-    FocusFBMediaDownloaderSyncUI();
-}
-
-void FocusFBMediaDownloaderSyncUI(void) {
-    if (!gMediaDownloaderReady) return;
-    if (!NSThread.isMainThread) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            FocusFBMediaDownloaderSyncUI();
-        });
-        return;
-    }
-
-    FFBSyncShareSheetDownloadBar();
-
-    UIWindow *win = FocusFBActiveWindow();
-    if (!win) return;
-
-    UIView *btnWrap = [win viewWithTag:kFFBQuickDownloadBtnTag];
-    BOOL showBtn = FFBShouldShowOptionalQuickButtonNow(win);
-
-    if (!showBtn) {
-        if (btnWrap) {
-            btnWrap.hidden = YES;
+        if (gMediaDownloaderReady) {
+            FFBScheduleReelButtonSyncBurst();
         }
-        if (gQuickBtnVisibilityTimer) {
-            [gQuickBtnVisibilityTimer invalidate];
-            gQuickBtnVisibilityTimer = nil;
-        }
-        return;
-    }
-
-    if (!btnWrap) {
-        UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
-        blur.tag = kFFBQuickDownloadBtnTag;
-        CGFloat sz = 40.0;
-        CGFloat topY = MAX(win.safeAreaInsets.top + 60.0, 108.0);
-        blur.frame = CGRectMake(14.0, topY, sz, sz);
-        blur.layer.cornerRadius = sz * 0.5;
-        blur.layer.borderWidth = 0.7;
-        blur.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.28].CGColor;
-        blur.clipsToBounds = YES;
-
-        UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-        btn.frame = blur.bounds;
-        btn.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        UIImageSymbolConfiguration *cfg = [UIImageSymbolConfiguration configurationWithPointSize:16.5 weight:UIImageSymbolWeightBold];
-        [btn setImage:[UIImage systemImageNamed:@"arrow.down.to.line" withConfiguration:cfg] forState:UIControlStateNormal];
-        btn.tintColor = [UIColor whiteColor];
-        [btn addTarget:[FFBQuickVideoButtonTarget shared] action:@selector(handleQuickTap:) forControlEvents:UIControlEventTouchUpInside];
-        [blur.contentView addSubview:btn];
-
-        UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc]
-            initWithTarget:[FFBQuickVideoButtonTarget shared]
-                    action:@selector(handleQuickPan:)];
-        [blur addGestureRecognizer:pan];
-
-        [win addSubview:blur];
-        btnWrap = blur;
-    }
-
-    btnWrap.hidden = NO;
-    [win bringSubviewToFront:btnWrap];
-
-    if (!gQuickBtnVisibilityTimer) {
-        gQuickBtnVisibilityTimer = [NSTimer scheduledTimerWithTimeInterval:0.60
-                                                                   repeats:YES
-                                                                     block:^(__unused NSTimer *timer) {
-            FocusFBMediaDownloaderSyncUI();
-        }];
-    }
-}
-
-static void FFBHook_UIApplication_sendEventMedia(id self, SEL _cmd, UIEvent *event) {
-    if (gOrigAppSendEventMedia) {
-        gOrigAppSendEventMedia(self, _cmd, event);
-    }
-    if (!gMediaDownloaderReady || !event || event.type != UIEventTypeTouches) return;
-    FocusFBPrefs *prefs = [FocusFBPrefs shared];
-    if (!prefs.enabled || !prefs.enableMediaDownload) return;
-
-    NSSet<UITouch *> *touches = event.allTouches;
-    if (touches.count != 1) return;
-    UITouch *t = touches.anyObject;
-    if (!t.window) return;
-
-    UITouchPhase phase = t.phase;
-    if (phase == UITouchPhaseBegan) {
-        gLastTouchDownPt = [t locationInView:t.window];
-        uint64_t seq = ++gTouchSeqID;
-        // Se l'utente fa long-press su un Reel (~0.5s), Facebook apre il menu Condividi mentre il dito è ancora giù!
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.58 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (gTouchSeqID == seq) {
-                FFBSyncShareSheetDownloadBar();
-            }
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.90 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            if (gTouchSeqID == seq) {
-                FFBSyncShareSheetDownloadBar();
-            }
-        });
-    } else if (phase == UITouchPhaseMoved) {
-        CGPoint curPt = [t locationInView:t.window];
-        if (hypot(curPt.x - gLastTouchDownPt.x, curPt.y - gLastTouchDownPt.y) >= 16.0) {
-            ++gTouchSeqID; // Invalida subito il controllo long-press durante qualsiasi scroll/drag!
-        }
-    } else if (phase == UITouchPhaseEnded) {
-        ++gTouchSeqID;
-        CGPoint endPt = [t locationInView:t.window];
-        // Solo su tap pulito (es. tap su pulsante Condividi o •••), zero lavoro durante scroll/swipe!
-        if (hypot(endPt.x - gLastTouchDownPt.x, endPt.y - gLastTouchDownPt.y) < 16.0) {
-            FFBScheduleShareSheetSyncBurst();
-        }
-    } else if (phase == UITouchPhaseCancelled) {
-        ++gTouchSeqID;
-        // Quando il long-press nativo di Facebook apre la barra Condividi, UIKit cancella il touch attivo!
-        FFBScheduleShareSheetSyncBurst();
     }
 }
 
@@ -1744,18 +1663,6 @@ static void FFBActivateMediaDownloaderNow(void) {
                                                       @selector(replaceCurrentItemWithPlayerItem:),
                                                       (IMP)FFBHook_AVPlayer_replaceCurrentItem,
                                                       (IMP *)&gOrigAVPlayerReplaceItem);
-        }
-        if (!gInstalledWindowAddHook) {
-            gInstalledWindowAddHook = FFBMediaHookMethod(UIWindow.class,
-                                                         @selector(didAddSubview:),
-                                                         (IMP)FFBHook_UIWindow_didAddSubview,
-                                                         (IMP *)&gOrigWindowDidAddSubview);
-        }
-        if (!gInstalledSendEventHook) {
-            gInstalledSendEventHook = FFBMediaHookMethod(UIApplication.class,
-                                                         @selector(sendEvent:),
-                                                         (IMP)FFBHook_UIApplication_sendEventMedia,
-                                                         (IMP *)&gOrigAppSendEventMedia);
         }
         gMediaDownloaderReady = YES;
         FocusFBMediaDownloaderSyncUI();
@@ -1791,7 +1698,7 @@ void FocusFBInstallMediaDownloader(void) {
                         object:nil
                          queue:[NSOperationQueue mainQueue]
                     usingBlock:^(__unused NSNotification *note) {
-            FocusFBMediaDownloaderSyncUI();
+            FFBScheduleReelButtonSyncBurst();
         }];
     });
 }

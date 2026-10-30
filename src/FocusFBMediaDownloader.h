@@ -8,14 +8,17 @@ NS_ASSUME_NONNULL_BEGIN
 extern "C" {
 #endif
 
-/// Installa il downloader per Video, Reels e Storie Video (integrato nel menu Condividi di Facebook)
+/// Installa il downloader nativo per i Reels (icona in stile Facebook sopra il tasto Mi piace)
 void FocusFBInstallMediaDownloader(void);
 
-/// Aggiorna il pulsante "Scarica video" nel menu Condividi / Opzioni e l'eventuale icona rapida
+/// Sincronizza o rimuove i pulsanti download nei Reels visibili
 void FocusFBMediaDownloaderSyncUI(void);
 
-/// Notifica la comparsa imminente o completata di un UIViewController (es. menu Condividi / BottomSheet)
+/// Notifica la comparsa di un controller (es. ingresso nella tab Reels o player full-screen)
 void FocusFBNotifyMediaControllerTransition(UIViewController * _Nullable vc);
+
+/// Chiamato dal layout delle UIScrollView/UICollectionView paginate dei Reels per agganciare ogni pagina
+void FocusFBMediaDownloaderOnScrollLayout(UIScrollView * _Nullable scrollView);
 
 #ifdef __cplusplus
 }

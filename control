@@ -1,8 +1,9 @@
 Package: com.focusfb.tweak
 Name: FocusFB
-Version: 2.6
+Version: 2.7
 Architecture: iphoneos-arm64
-Description: Distraction-free Facebook for iOS: Marketplace-only mode, ad & feed clutter blocker, video/Reels downloader in share menu, incognito stories, and Feed/Reels physical QR/NFC lock.
+Description: Distraction-free Facebook for iOS: Marketplace mode, AdBlock, native Reels downloader, incognito Stories, and physical key lock.
 Maintainer: Skiliflippo
 Author: Skiliflippo
 Section: Tweaks
+Depends: firmware (>= 15.0)
